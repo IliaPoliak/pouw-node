@@ -1,9 +1,13 @@
 name: Docker image
 
-# Publishes an image to GitHub Container Registry: ghcr.io/pouw-zk/<repository>
+# Publishes images to GitHub Container Registry for linux/amd64 (the server,
+# x86 laptops) and linux/arm64 (Apple Silicon):
+#   .  -> ghcr.io/pouw-zk/pouw-node
 # main   -> tags :main and :sha-xxxxxxx
 # v1.2.3 -> tags :v1.2.3 and :latest
-# As long as there is no Dockerfile, the workflow only prints a message.
+# Each platform builds natively on its own runner (no emulation) and pushes by
+# digest; the merge job joins the digests into one multi-platform tag.
+# An image whose directory is not ready yet (see `requires`) is skipped with a message.
 
 on:
   push:
@@ -16,31 +20,91 @@ permissions:
   packages: write
 
 jobs:
-  image:
-    runs-on: ubuntu-latest
+  build:
+    name: build ${{ matrix.target.image }} (${{ matrix.arch.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { dir: ., image: pouw-node, requires: Dockerfile }
+        arch:
+          - { platform: linux/amd64, runner: ubuntu-latest, name: amd64 }
+          - { platform: linux/arm64, runner: ubuntu-24.04-arm, name: arm64 }
+    runs-on: ${{ matrix.arch.runner }}
     steps:
       - uses: actions/checkout@v7
 
-      - name: Detect Dockerfile
+      - name: Detect project
         id: detect
+        env:
+          REQUIRES: ${{ matrix.target.requires }}
+          DIR: ${{ matrix.target.dir }}
         run: |
-          if [ -f Dockerfile ]; then
+          if [ -f "$DIR/Dockerfile" ] && [ -f "$REQUIRES" ]; then
             echo "found=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::There is no Dockerfile yet, so there is nothing to publish."
+            echo "::notice::$DIR/Dockerfile or $REQUIRES does not exist yet, nothing to publish."
           fi
 
-      - name: Build and push
+      - name: Build and push by digest
         if: steps.detect.outputs.found == 'true'
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIR: ${{ matrix.target.dir }}
+          IMAGE: ghcr.io/pouw-zk/${{ matrix.target.image }}
+          PLATFORM: ${{ matrix.arch.platform }}
         run: |
-          image="ghcr.io/${GITHUB_REPOSITORY,,}"
           echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          tags=(-t "$image:sha-${GITHUB_SHA::7}")
-          if [ "$GITHUB_REF" = "refs/heads/main" ]; then tags+=(-t "$image:main"); fi
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then tags+=(-t "$image:$GITHUB_REF_NAME" -t "$image:latest"); fi
-          docker build \
+          # the docker-container builder can push an image by digest only
+          docker buildx create --use >/dev/null
+          docker buildx build --platform "$PLATFORM" \
             --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
-            "${tags[@]}" .
-          docker push --all-tags "$image"
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true" \
+            --metadata-file metadata.json "$DIR"
+          digest="$(jq -r '."containerimage.digest"' metadata.json)"
+          mkdir -p digests
+          touch "digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v7
+        if: steps.detect.outputs.found == 'true'
+        with:
+          name: digests-${{ matrix.target.image }}-${{ matrix.arch.name }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: merge ${{ matrix.target.image }}
+    needs: build
+    strategy:
+      matrix:
+        target:
+          - { dir: ., image: pouw-node, requires: Dockerfile }
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: digests-${{ matrix.target.image }}-*
+          merge-multiple: true
+          path: digests
+
+      - name: Tag the multi-platform image
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ghcr.io/pouw-zk/${{ matrix.target.image }}
+        run: |
+          shopt -s nullglob
+          digests=(digests/*)
+          if [ ${#digests[@]} -eq 0 ]; then
+            echo "::notice::No image was built, nothing to tag."
+            exit 0
+          fi
+          echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          tags=(-t "$IMAGE:sha-${GITHUB_SHA::7}")
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then tags+=(-t "$IMAGE:main"); fi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then tags+=(-t "$IMAGE:$GITHUB_REF_NAME" -t "$IMAGE:latest"); fi
+          refs=()
+          for d in "${digests[@]}"; do refs+=("$IMAGE@sha256:${d#digests/}"); done
+          docker buildx imagetools create "${tags[@]}" "${refs[@]}"
+          docker buildx imagetools inspect "$IMAGE:sha-${GITHUB_SHA::7}"
