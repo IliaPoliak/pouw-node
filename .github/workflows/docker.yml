@@ -69,7 +69,9 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: steps.detect.outputs.found == 'true'
         with:
-          name: digests-${{ matrix.target.image }}-${{ matrix.arch.name }}
+          # -- separates the image from the platform, so the pattern of one image
+          # never matches another (pouw-dashboard-* would match pouw-dashboard-hasura)
+          name: digests--${{ matrix.target.image }}--${{ matrix.arch.name }}
           path: digests/*
           if-no-files-found: error
           retention-days: 1
@@ -78,6 +80,8 @@ jobs:
     name: merge ${{ matrix.target.image }}
     needs: build
     strategy:
+      # one image failing must not cancel the tagging of the other
+      fail-fast: false
       matrix:
         target:
           - { dir: ., image: pouw-node, requires: Dockerfile }
@@ -85,7 +89,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
-          pattern: digests-${{ matrix.target.image }}-*
+          pattern: digests--${{ matrix.target.image }}--*
           merge-multiple: true
           path: digests
 
