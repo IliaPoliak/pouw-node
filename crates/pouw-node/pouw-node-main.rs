@@ -169,6 +169,7 @@ fn start(config: NodeConfig, spec: &ChainSpec, genesis: &Block) -> Result<(), St
 
     let shutdown = Signals::new(signals::SHUTDOWN_SIGNALS).map_err(StartError::Signals)?;
     let transport = TransportConfig {
+        data_dir: config.data_dir,
         network: spec.network.clone(),
         listen: config.p2p_listen,
         bootnodes: config.bootnodes,
