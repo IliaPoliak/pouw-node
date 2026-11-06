@@ -188,7 +188,7 @@ fn start(config: NodeConfig, spec: &ChainSpec, genesis: &Block) -> Result<(), St
         p2p::run_transport(&transport, &params, outbound, &inbound)
     })?;
     spawn(Component::Api, &control, move || {
-        api::serve(config.api_addr, &requests)
+        api::serve(config.api_addr, config.api_fixtures.as_deref(), &requests)
     })?;
     spawn(Component::Metrics, &control, move || {
         metrics::serve(config.metrics_addr, &metrics_requests)

@@ -248,6 +248,9 @@ pub enum Component {
 /// Why a component thread ended with an error.
 #[derive(Debug, Error)]
 pub enum ComponentFault {
+    /// `POUW_API_FIXTURES` names a folder without a usable `chain.json`.
+    #[error("cannot read the API fixtures: {0}")]
+    Fixtures(String),
     #[error("cannot start the async runtime: {0}")]
     Runtime(#[from] io::Error),
     #[error("a task of the component failed: {0}")]

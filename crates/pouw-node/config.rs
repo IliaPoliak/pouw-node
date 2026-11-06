@@ -29,6 +29,9 @@ pub mod var {
     pub const API_ADDR: &str = "POUW_API_ADDR";
     /// Address of `/metrics`. Default `[::]:9100`, both IP families.
     pub const METRICS_ADDR: &str = "POUW_METRICS_ADDR";
+    /// Folder with the `chain.json` of `contracts/fixtures`. When set, the API answers
+    /// from it as a mock node (pouw-node#59). Default unset.
+    pub const API_FIXTURES: &str = "POUW_API_FIXTURES";
     /// Directory of the database and the node key. Default `data`.
     pub const DATA_DIR: &str = "POUW_DATA_DIR";
     /// `memory` or `rocksdb`. Default `memory`.
@@ -131,6 +134,8 @@ pub struct NodeConfig {
     pub chain_spec: Option<PathBuf>,
     pub api_addr: SocketAddr,
     pub metrics_addr: SocketAddr,
+    /// Folder of the fixture chain the API serves instead of the node, if any.
+    pub api_fixtures: Option<PathBuf>,
     pub data_dir: PathBuf,
     pub store: StoreKind,
     pub prover: ProverKind,
@@ -212,6 +217,7 @@ impl NodeConfig {
                 var::CHAIN_SPEC => config.chain_spec = Some(PathBuf::from(value)),
                 var::API_ADDR => config.api_addr = parse(var::API_ADDR, &value)?,
                 var::METRICS_ADDR => config.metrics_addr = parse(var::METRICS_ADDR, &value)?,
+                var::API_FIXTURES => config.api_fixtures = Some(PathBuf::from(value)),
                 var::DATA_DIR => config.data_dir = PathBuf::from(value),
                 var::STORE => {
                     config.store = match value.as_str() {
@@ -328,6 +334,7 @@ impl Default for NodeConfig {
             chain_spec: None,
             api_addr: SocketAddr::from((Ipv6Addr::UNSPECIFIED, 8000)),
             metrics_addr: SocketAddr::from((Ipv6Addr::UNSPECIFIED, 9100)),
+            api_fixtures: None,
             data_dir: PathBuf::from("data"),
             store: StoreKind::Memory,
             prover: ProverKind::Mock {

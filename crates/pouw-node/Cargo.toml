@@ -22,6 +22,7 @@ rocksdb = []
 store-mem = []
 
 [dependencies]
+axum.workspace = true
 borsh.workspace = true
 pouw-api.workspace = true
 pouw-consensus.workspace = true
@@ -29,6 +30,7 @@ pouw-crypto.workspace = true
 pouw-provers.workspace = true
 pouw-types.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 signal-hook.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -38,4 +40,3 @@ zerocopy.workspace = true
 
 [dev-dependencies]
 pouw-node = { path = ".", features = ["store-mem"] }
-serde_json.workspace = true

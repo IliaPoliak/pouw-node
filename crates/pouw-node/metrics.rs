@@ -7,7 +7,6 @@
 use std::{net::SocketAddr, time::Duration};
 
 use tokio::sync::mpsc;
-use tracing::warn;
 
 use crate::{api::ApiRequest, node::ComponentFault};
 
@@ -130,11 +129,9 @@ pub fn render(metrics: &Metrics) -> String {
 }
 
 /// The `/metrics` thread: answers scrapes on `addr` with the text of
-/// [`crate::api::ApiRequest::Metrics`]. The HTTP endpoint is pouw-node#63; until it
-/// exists the thread ends at once.
-pub fn serve(addr: SocketAddr, _api: &mpsc::Sender<ApiRequest>) -> Result<(), ComponentFault> {
-    warn!(%addr, "pouw-node#63: no /metrics endpoint, the address is not served");
-    Ok(())
+/// [`crate::api::ApiRequest::Metrics`], see [`crate::http`].
+pub fn serve(addr: SocketAddr, api: &mpsc::Sender<ApiRequest>) -> Result<(), ComponentFault> {
+    crate::http::serve_metrics(addr, api)
 }
 
 fn header(metric: Metric) -> String {
