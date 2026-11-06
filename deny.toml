@@ -7,6 +7,9 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+  { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained, not vulnerable; libp2p pulls it in via if-watch and netlink, no fixed version exists" },
+]
 
 [licenses]
 version = 2
