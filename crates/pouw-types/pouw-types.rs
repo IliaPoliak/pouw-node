@@ -42,4 +42,6 @@ pub use pouw_crypto as crypto;
 pub use zerocopy::little_endian::{U32, U64};
 
 #[cfg(test)]
+mod fixtures;
+#[cfg(test)]
 mod tests;
