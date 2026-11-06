@@ -157,4 +157,6 @@ impl NodeClient {
 }
 
 #[cfg(test)]
+mod fixtures;
+#[cfg(test)]
 mod tests;
