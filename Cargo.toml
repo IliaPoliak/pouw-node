@@ -33,7 +33,7 @@ panic = "abort"
 
 [workspace.dependencies]
 futures = { version = "0.3.31", default-features = false, features = ["std"] }
-libp2p = { version = "0.57.1", default-features = false, features = ["tokio", "tcp", "dns", "noise", "yamux", "identify", "kad", "ed25519", "macros"] }
+libp2p = { version = "0.57.1", default-features = false, features = ["tokio", "tcp", "dns", "noise", "yamux", "identify", "kad", "ed25519", "macros", "gossipsub"] }
 base64 = "0.22.1"
 borsh = { version = "1.5.7", features = ["derive"] }
 clap = { version = "4.5.48", features = ["derive"] }

@@ -575,8 +575,12 @@ pub fn topic_named(subscriptions: &[Subscription], text: &str) -> Option<Topic> 
 /// loop has not seen yet.
 #[derive(Debug)]
 pub enum Wire {
-    /// A gossip message that arrived on the topic named `topic`.
+    /// A gossip message that arrived on the topic named `topic`. `id` is the number the
+    /// swarm gave the message: the node's verdict names the message by it, and the
+    /// transport passes it back as [`ToSwarm::Verdict`]. `from` is the peer that sent the
+    /// message to this node.
     Gossip {
+        id: MessageId,
         topic: String,
         from: Vec<u8>,
         bytes: Vec<u8>,
@@ -603,6 +607,31 @@ pub enum Wire {
 /// The transport's end of the channel the swarm feeds, of capacity [`WIRE_CAPACITY`].
 /// The swarm sends with `send().await`, so a full channel stops its reads.
 pub type WireIn = mpsc::Receiver<Wire>;
+
+/// What the transport asks of the swarm.
+#[derive(Debug)]
+pub enum ToSwarm {
+    /// Publish `bytes` on the gossip topic whose protocol id is `topic`.
+    Publish { topic: String, bytes: Vec<u8> },
+    /// The verdict on the gossip message `id` the swarm handed over as [`Wire::Gossip`].
+    /// The swarm relays an `Accept`, and drops an `Ignore` or a `Reject`.
+    Verdict {
+        id: MessageId,
+        acceptance: Acceptance,
+    },
+}
+
+/// Capacity of the channel from the transport to the swarm. The transport sends with
+/// `try_send` and never waits: a full channel drops the request with a warning, because
+/// the swarm may itself wait for the transport, and two threads that wait for each other
+/// never continue.
+pub const SWARM_COMMAND_CAPACITY: usize = 256;
+
+/// The transport's end of the channel to the swarm.
+pub type SwarmIn = mpsc::Sender<ToSwarm>;
+
+/// The swarm's end of the channel from the transport.
+pub type SwarmOut = mpsc::Receiver<ToSwarm>;
 
 /// What became of the bytes of one gossip message.
 #[derive(Debug)]
@@ -692,8 +721,8 @@ pub async fn on_sync_request_bytes(
 pub struct Transport {
     pub peers: Peers,
     pub scores: Scores,
-    /// The id of the next gossip message handed to the node.
-    pub next_message: u64,
+    /// The channel to the swarm, or `None` when there is no swarm to talk to.
+    pub swarm: Option<SwarmIn>,
     /// The id of the next sync request handed to the node.
     pub next_serve: u64,
     /// Buffers of the precheck, which runs on this thread.
@@ -722,7 +751,9 @@ pub struct TransportConfig {
     pub data_dir: PathBuf,
 }
 
-/// Builds the libp2p swarm of the node and returns the channel it feeds.
+/// Builds the libp2p swarm of the node and returns the channel it feeds ([`WireIn`]) and
+/// the channel that commands it ([`SwarmIn`]). Identify, Kademlia (pouw-node#85) and
+/// gossipsub (pouw-node#86) are built; the rest of the list below is not.
 ///
 /// To build, pouw-node#85:
 /// - identify, so a peer learns the listen addresses and the protocol ids of another
@@ -744,7 +775,7 @@ pub struct TransportConfig {
 ///
 /// Test: two swarms on one machine with the same network connect, exchange `Status`
 /// and see each other's gossip. A swarm of another network is never connected.
-pub fn start_swarm(config: &TransportConfig) -> Result<WireIn, swarm::SwarmError> {
+pub fn start_swarm(config: &TransportConfig) -> Result<(WireIn, SwarmIn), swarm::SwarmError> {
     swarm::start(config)
 }
 
@@ -758,29 +789,55 @@ pub fn run_transport(
     outbound: Outbound,
     inbound: &mpsc::Sender<Inbound>,
 ) -> Result<(), ComponentFault> {
-    let wire = start_swarm(config).map_err(|error| ComponentFault::Swarm(Box::new(error)))?;
-    serve(&config.network, params, outbound, wire, inbound)
+    let (wire, to_swarm) =
+        start_swarm(config).map_err(|error| ComponentFault::Swarm(Box::new(error)))?;
+    serve_with(
+        &config.network,
+        params,
+        outbound,
+        wire,
+        Some(to_swarm),
+        inbound,
+    )
+}
+
+/// [`serve_with`] without a swarm to talk to: gossip to publish and verdicts go nowhere.
+pub fn serve(
+    network: &NetworkName,
+    params: &ConsensusParams,
+    outbound: Outbound,
+    wire: WireIn,
+    inbound: &mpsc::Sender<Inbound>,
+) -> Result<(), ComponentFault> {
+    serve_with(network, params, outbound, wire, None, inbound)
 }
 
 /// Handles commands and wire messages one at a time on one thread, with commands
 /// first, until both sources have ended. A message that cannot belong to the swarm (a
 /// peer id over [`MAX_PEER_ID_BYTES`]) stops the transport with a fault, so a broken
-/// swarm glue is not mistaken for a bad peer.
-pub fn serve(
+/// swarm glue is not mistaken for a bad peer. `to_swarm` is where gossip to publish and
+/// the verdicts on received gossip go; the swarm stops when it is dropped.
+pub fn serve_with(
     network: &NetworkName,
     params: &ConsensusParams,
     mut outbound: Outbound,
     mut wire: WireIn,
+    to_swarm: Option<SwarmIn>,
     inbound: &mpsc::Sender<Inbound>,
 ) -> Result<(), ComponentFault> {
     let subscriptions = subscriptions(network);
     info!(?subscriptions, "gossip topics");
     let runtime = runtime::Builder::new_current_thread().build()?;
     runtime.block_on(async {
-        let mut transport = Transport::default();
+        let mut transport = Transport {
+            swarm: to_swarm,
+            ..Transport::default()
+        };
         while let Some(step) = next_step(&mut outbound, &mut wire).await {
             match step {
-                Step::Command(command) => on_command(&mut transport, command, inbound).await?,
+                Step::Command(command) => {
+                    on_command(&mut transport, &subscriptions, command, inbound).await?;
+                }
                 Step::Wire(message) => {
                     on_wire(&mut transport, params, &subscriptions, message, inbound).await?;
                 }
@@ -817,8 +874,51 @@ async fn to_node(inbound: &mpsc::Sender<Inbound>, message: Inbound) -> Result<()
         .map_err(|mpsc::error::SendError(_)| ComponentFault::NodeGone)
 }
 
+/// Sends `request` to the swarm without waiting. A full channel or a swarm that is gone
+/// drops the request with a warning: gossip is best effort, and the transport must not
+/// wait for a swarm that may wait for it.
+fn ask_swarm(transport: &Transport, request: ToSwarm) {
+    let Some(swarm) = &transport.swarm else {
+        debug!(?request, "no swarm to ask");
+        return;
+    };
+    if let Err(error) = swarm.try_send(request) {
+        warn!(%error, "the swarm did not take a request");
+    }
+}
+
+/// Passes the verdict on the gossip message `id` to the swarm.
+fn judge(transport: &Transport, id: MessageId, acceptance: Acceptance) {
+    ask_swarm(transport, ToSwarm::Verdict { id, acceptance });
+}
+
+/// Asks the swarm to publish `message` on its topic.
+fn publish(transport: &Transport, subscriptions: &[Subscription], message: &Gossip) {
+    let topic = message.topic();
+    let Some(subscription) = subscriptions
+        .iter()
+        .find(|subscription| subscription.topic == topic)
+    else {
+        warn!(
+            ?topic,
+            "no subscription for the topic of a message to publish"
+        );
+        return;
+    };
+    let bytes = match message.to_wire() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warn!(%error, ?topic, "a message to publish that does not encode");
+            return;
+        }
+    };
+    let topic = subscription.id.clone();
+    ask_swarm(transport, ToSwarm::Publish { topic, bytes });
+}
+
 async fn on_command(
     transport: &mut Transport,
+    subscriptions: &[Subscription],
     command: Command,
     inbound: &mpsc::Sender<Inbound>,
 ) -> Result<(), ComponentFault> {
@@ -829,17 +929,16 @@ async fn on_command(
         }
         Command::Report(peer, why) => apply_penalty(transport, peer, why),
         Command::Validate {
+            id,
             from,
             topic,
-            acceptance: Acceptance::Reject,
-            ..
-        } => apply_penalty(transport, from, rejection(topic)),
-        Command::Validate {
-            id,
-            topic,
             acceptance,
-            ..
-        } => debug!(?id, ?topic, ?acceptance, "verdict on a gossip message"),
+        } => {
+            if acceptance == Acceptance::Reject {
+                apply_penalty(transport, from, rejection(topic));
+            }
+            judge(transport, id, acceptance);
+        }
         Command::Answer { id, response } => {
             debug!(?id, ?response, "answer to a sync request");
         }
@@ -847,7 +946,7 @@ async fn on_command(
         Command::Disconnect { peer, reason } => {
             debug!(?peer, %reason, "no connection to close");
         }
-        command @ Command::Broadcast(_) => debug!(?command, "no peer to send to"),
+        Command::Broadcast(message) => publish(transport, subscriptions, &message),
     }
     Ok(())
 }
@@ -860,18 +959,23 @@ async fn on_wire(
     inbound: &mpsc::Sender<Inbound>,
 ) -> Result<(), ComponentFault> {
     match message {
-        Wire::Gossip { topic, from, bytes } => {
+        Wire::Gossip {
+            id,
+            topic,
+            from,
+            bytes,
+        } => {
             let from = PeerId::from_bytes(&from)?;
             let Some(topic) = topic_named(subscriptions, &topic) else {
                 warn!(topic, "message on a topic the node did not subscribe to");
+                judge(transport, id, Acceptance::Ignore);
                 return Ok(());
             };
             let Some(peer) = transport.peers.by_id.get(&from).copied() else {
                 warn!(?from, "gossip from a peer that is not connected");
+                judge(transport, id, Acceptance::Ignore);
                 return Ok(());
             };
-            let id = MessageId(transport.next_message);
-            transport.next_message = transport.next_message.wrapping_add(1);
             match on_gossip_bytes(
                 topic,
                 peer,
@@ -887,6 +991,7 @@ async fn on_wire(
                 Received::Refused(error) => {
                     warn!(%error, ?from, "message refused before the node");
                     apply_penalty(transport, peer, error.misbehavior());
+                    judge(transport, id, Acceptance::Reject);
                 }
                 Received::NodeGone => return Err(ComponentFault::NodeGone),
             }
@@ -1398,6 +1503,7 @@ mod tests {
             borsh::to_vec(&SyncRequest::GetBlocks(GetBlocks { ids: vec![] })).unwrap();
         for message in [
             Wire::Gossip {
+                id: MessageId(10),
                 topic: topic.clone(),
                 from: from.clone(),
                 bytes: transfer_bytes(),
@@ -1405,21 +1511,25 @@ mod tests {
             Wire::PeerConnected(from.clone()),
             Wire::PeerConnected(from.clone()),
             Wire::Gossip {
+                id: MessageId(11),
                 topic: topic.clone(),
                 from: from.clone(),
                 bytes: transfer_bytes(),
             },
             Wire::Gossip {
+                id: MessageId(12),
                 topic: topic.clone(),
                 from: from.clone(),
                 bytes: vec![0xff],
             },
             Wire::Gossip {
+                id: MessageId(13),
                 topic: "/other".to_owned(),
                 from: from.clone(),
                 bytes: transfer_bytes(),
             },
             Wire::Gossip {
+                id: MessageId(14),
                 topic,
                 from: stranger.clone(),
                 bytes: transfer_bytes(),
@@ -1446,7 +1556,7 @@ mod tests {
         assert!(matches!(
             inbox.try_recv(),
             Ok(Inbound::Gossip {
-                id: MessageId(0),
+                id: MessageId(11),
                 from: PeerIx(0),
                 ..
             })
@@ -1528,6 +1638,7 @@ mod tests {
         swarm.try_send(Wire::PeerConnected(b"p".to_vec())).unwrap();
         swarm
             .try_send(Wire::Gossip {
+                id: MessageId(15),
                 topic: "/pouw/devnet/coin-txs/1".to_owned(),
                 from: b"p".to_vec(),
                 bytes: transfer_bytes(),
@@ -1562,6 +1673,119 @@ mod tests {
         });
         serve(&devnet(), &params(), outbound, wire, &inbound).unwrap();
         node.join().unwrap();
+    }
+
+    #[test]
+    fn verdicts_and_broadcasts_of_the_node_go_to_the_swarm() {
+        let (network, outbound) = mpsc::channel(8);
+        let (inbound, mut inbox) = mpsc::channel(4);
+        let (swarm, wire) = mpsc::channel(4);
+        let (to_swarm, mut commands) = mpsc::channel(8);
+        swarm.try_send(Wire::PeerConnected(b"p".to_vec())).unwrap();
+        swarm
+            .try_send(Wire::Gossip {
+                id: MessageId(40),
+                topic: "/pouw/devnet/coin-txs/1".to_owned(),
+                from: b"p".to_vec(),
+                bytes: transfer_bytes(),
+            })
+            .unwrap();
+        let node = std::thread::spawn(move || {
+            let Some(Inbound::PeerConnected { .. }) = inbox.blocking_recv() else {
+                panic!("the node saw no peer");
+            };
+            let Some(Inbound::Gossip { id, from, message }) = inbox.blocking_recv() else {
+                panic!("the node got no gossip");
+            };
+            assert_eq!(id, MessageId(40));
+            let verdict = Command::Validate {
+                id,
+                from,
+                topic: message.topic(),
+                acceptance: Acceptance::Accept,
+            };
+            network.blocking_send(verdict).unwrap();
+            network.blocking_send(Command::Broadcast(message)).unwrap();
+            drop((swarm, network));
+        });
+        serve_with(
+            &devnet(),
+            &params(),
+            outbound,
+            wire,
+            Some(to_swarm),
+            &inbound,
+        )
+        .unwrap();
+        node.join().unwrap();
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(ToSwarm::Verdict {
+                id: MessageId(40),
+                acceptance: Acceptance::Accept
+            })
+        ));
+        let Ok(ToSwarm::Publish { topic, bytes }) = commands.try_recv() else {
+            panic!("nothing to publish");
+        };
+        assert_eq!(topic, "/pouw/devnet/coin-txs/1");
+        assert_ne!(bytes, Vec::<u8>::new());
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_message_that_does_not_decode_is_rejected_at_the_swarm() {
+        let (network, outbound) = mpsc::channel(1);
+        let (inbound, mut inbox) = mpsc::channel(4);
+        let (swarm, wire) = mpsc::channel(4);
+        let (to_swarm, mut commands) = mpsc::channel(8);
+        swarm.try_send(Wire::PeerConnected(b"p".to_vec())).unwrap();
+        swarm
+            .try_send(Wire::Gossip {
+                id: MessageId(41),
+                topic: "/pouw/devnet/coin-txs/1".to_owned(),
+                from: b"p".to_vec(),
+                bytes: vec![0xff],
+            })
+            .unwrap();
+        swarm
+            .try_send(Wire::Gossip {
+                id: MessageId(42),
+                topic: "/pouw/devnet/coin-txs/1".to_owned(),
+                from: b"stranger".to_vec(),
+                bytes: transfer_bytes(),
+            })
+            .unwrap();
+        drop((swarm, network));
+        serve_with(
+            &devnet(),
+            &params(),
+            outbound,
+            wire,
+            Some(to_swarm),
+            &inbound,
+        )
+        .unwrap();
+        assert!(matches!(
+            inbox.try_recv(),
+            Ok(Inbound::PeerConnected { .. })
+        ));
+        assert!(inbox.try_recv().is_err());
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(ToSwarm::Verdict {
+                id: MessageId(41),
+                acceptance: Acceptance::Reject
+            })
+        ));
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(ToSwarm::Verdict {
+                id: MessageId(42),
+                acceptance: Acceptance::Ignore
+            })
+        ));
+        assert!(commands.try_recv().is_err());
     }
 
     #[test]
