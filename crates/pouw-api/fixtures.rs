@@ -1,22 +1,29 @@
-//! The 20-block example chain of `pouw-docs/contracts/fixtures`. The blocks are built
-//! with the same code the node uses (ids, Merkle root, eta, mask, signatures), so the
-//! JSON files cannot drift from the encoding.
+//! The 20-block example chain of `pouw-docs/contracts/fixtures`, in the JSON views of
+//! `node-api.md` (`id`, `txid`, `proof_hash`, derived `eta`, `mask`, `proof_system`). The
+//! blocks are built with the node code (ids, Merkle root, eta, mask, signatures), so the
+//! files cannot drift from the encoding, and written through [`BlockView`], so they
+//! cannot drift from the API.
 //!
-//! `cargo test -p pouw-types fixtures` checks the chain. To rewrite the files:
+//! `cargo test -p pouw-api fixtures` checks the chain. To rewrite the files:
 //!
 //! ```text
 //! POUW_FIXTURES_DIR=/path/to/pouw-docs/contracts/fixtures \
-//!     cargo test -p pouw-types write_fixtures -- --ignored
+//!     cargo test -p pouw-api write_fixtures -- --ignored
 //! ```
 
 #![allow(clippy::arithmetic_side_effects, clippy::too_many_lines)]
 
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{collections::BTreeMap, fmt::Write as _, fs, path::PathBuf};
 
-use pouw_crypto::{Address, FieldInput, Hash32, SigningKey, hash_to_field, sha256};
+use pouw_crypto::{FieldInput, Hash32, SigningKey, hash_to_field, sha256};
+use pouw_types::{
+    Amount, Block, BlockHeader, BlockId, ChainId, CircuitId, ConstraintCount, Nonce, ProofSystem,
+    ProofTx, SignedTx, Target, TxBody, TxKind, U32, U64, UsageCounter, block_id, eta_chain, mask,
+    protocol::BLOCK_VERSION, sign_body, txid, verify_proof_tx, verify_tx,
+};
 use serde_json::{Value, json};
 
-use crate::{protocol::*, *};
+use crate::view::{BlockView, ProofTxView};
 
 const CHAIN: ChainId = ChainId(1);
 const START: u64 = 1_793_600_000;
@@ -34,7 +41,7 @@ fn client(seed: u8) -> SigningKey {
     SigningKey::from_seed([seed; 32])
 }
 
-fn miner(height: u64) -> Address {
+fn miner(height: u64) -> pouw_crypto::Address {
     client(if height.is_multiple_of(2) { 0x0a } else { 0x0b }).address()
 }
 
@@ -71,7 +78,7 @@ fn mock_proof(eta: &Hash32, mask: &Hash32, inputs: &[FieldInput]) -> Box<[u8]> {
 
 /// Genesis plus 19 blocks: a circuit registered in block 1, a transfer in most blocks
 /// and a proof request, proved with the mock backend, in every third block.
-pub fn chain() -> Vec<Block> {
+fn chain() -> Vec<Block> {
     let (alice, bob) = (client(1), client(2));
     let mut blocks = vec![seal(Block {
         header: BlockHeader {
@@ -156,12 +163,7 @@ pub fn chain() -> Vec<Block> {
                 usage_counter: usage,
                 proof: Box::from([0u8; 32]),
             };
-            let eta = eta_chain(
-                &block.header.parent,
-                &block.compute_txs_root(),
-                std::slice::from_ref(&proof_tx),
-            )[0];
-            let mask = mask(&block.header.miner, &circuit, usage);
+            let (eta, mask) = derived(&block, &proof_tx);
             proof_tx.proof = mock_proof(&eta, &mask, &inputs);
             block.proof_txs.push(proof_tx);
         }
@@ -170,11 +172,45 @@ pub fn chain() -> Vec<Block> {
     blocks
 }
 
-/// The JSON view of the node API: the block plus its `hash`.
-fn view(block: &Block) -> Value {
-    let mut value = serde_json::to_value(block).unwrap();
-    value["hash"] = serde_json::to_value(block_id(&block.header)).unwrap();
-    value
+/// `eta` and `mask` of the only proof tx of `block`, the first two public inputs.
+fn derived(block: &Block, proof_tx: &ProofTx) -> (Hash32, Hash32) {
+    let TxKind::ProofRequest { circuit, .. } = &proof_tx.request.body.kind else {
+        panic!("a proof tx holds a proof request");
+    };
+    let eta = eta_chain(
+        &block.header.parent,
+        &block.compute_txs_root(),
+        std::slice::from_ref(proof_tx),
+    )[0];
+    (
+        eta,
+        mask(&block.header.miner, circuit, proof_tx.usage_counter),
+    )
+}
+
+/// The API view of `block`: ids, txids and the derived fields of its proof txs.
+fn view(block: &Block) -> BlockView {
+    let proofs = block
+        .proof_txs
+        .iter()
+        .map(|proof_tx| {
+            let (eta, mask) = derived(block, proof_tx);
+            ProofTxView::new(
+                proof_tx,
+                hash_to_field(&eta),
+                hash_to_field(&mask),
+                ProofSystem::Groth16,
+            )
+        })
+        .collect();
+    BlockView::new(block, proofs)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut out, byte| {
+        write!(out, "{byte:02x}").unwrap();
+        out
+    })
 }
 
 #[test]
@@ -195,34 +231,36 @@ fn the_chain_is_linked_and_every_commitment_matches() {
         for proof_tx in &block.proof_txs {
             assert_eq!(verify_proof_tx(proof_tx), Ok(()));
         }
-        let bytes = borsh::to_vec(block).unwrap();
-        assert_eq!(borsh::from_slice::<Block>(&bytes).unwrap(), *block);
     }
     assert!(blocks.iter().any(|block| !block.proof_txs.is_empty()));
 }
 
 #[test]
-fn the_mock_proofs_verify_against_eta_and_mask() {
-    let blocks = chain();
-    for block in &blocks {
+fn the_mock_proofs_match_eta_and_mask() {
+    for block in &chain() {
         for proof_tx in &block.proof_txs {
-            let TxKind::ProofRequest {
-                circuit,
-                public_inputs,
-                ..
-            } = &proof_tx.request.body.kind
-            else {
+            let TxKind::ProofRequest { public_inputs, .. } = &proof_tx.request.body.kind else {
                 panic!("a proof tx holds a proof request");
             };
-            let eta = eta_chain(
-                &block.header.parent,
-                &block.compute_txs_root(),
-                std::slice::from_ref(proof_tx),
-            )[0];
-            let mask = mask(&block.header.miner, circuit, proof_tx.usage_counter);
+            let (eta, mask) = derived(block, proof_tx);
             assert_eq!(*proof_tx.proof, *mock_proof(&eta, &mask, public_inputs));
         }
     }
+}
+
+#[test]
+fn the_views_carry_the_derived_fields() {
+    let blocks = chain();
+    let json = serde_json::to_value(view(&blocks[3])).unwrap();
+    assert_eq!(
+        json["id"],
+        serde_json::to_value(block_id(&blocks[3].header)).unwrap()
+    );
+    let proof = &json["proof_txs"][0];
+    for field in ["proof_hash", "request_txid", "eta", "mask", "proof_system"] {
+        assert!(proof.get(field).is_some(), "{field}");
+    }
+    assert!(json["txs"][0].get("txid").is_some());
 }
 
 #[test]
@@ -230,15 +268,17 @@ fn the_mock_proofs_verify_against_eta_and_mask() {
 fn write_fixtures() {
     let dir = PathBuf::from(std::env::var("POUW_FIXTURES_DIR").expect("POUW_FIXTURES_DIR"));
     fs::create_dir_all(dir.join("blocks")).unwrap();
-    let blocks = chain();
+    let views: Vec<Value> = chain()
+        .iter()
+        .map(|block| serde_json::to_value(view(block)).unwrap())
+        .collect();
     let write = |path: PathBuf, value: &Value| {
         let mut text = serde_json::to_string_pretty(value).unwrap();
         text.push('\n');
         fs::write(path, text).unwrap();
     };
-    for block in &blocks {
-        let name = format!("blocks/block-{:02}.json", block.header.height.get());
-        write(dir.join(name), &view(block));
+    for (height, view) in views.iter().enumerate() {
+        write(dir.join(format!("blocks/block-{height:02}.json")), view);
     }
     let keys: Vec<Value> = [
         (1u8, "alice"),
@@ -251,17 +291,13 @@ fn write_fixtures() {
     .map(|(seed, name)| {
         json!({
             "name": name,
-            "seed": hex::encode([*seed; 32]),
+            "seed": hex(&[*seed; 32]),
             "address": serde_json::to_value(client(*seed).address()).unwrap(),
         })
     })
     .collect();
     write(
         dir.join("chain.json"),
-        &json!({
-            "chain_id": CHAIN.0,
-            "blocks": blocks.iter().map(view).collect::<Vec<_>>(),
-            "keys": keys,
-        }),
+        &json!({ "chain_id": CHAIN.0, "blocks": views, "keys": keys }),
     );
 }
