@@ -598,6 +598,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pouw-light-node"
+version = "0.1.0"
+dependencies = [
+ "pouw-api",
+ "signal-hook",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "pouw-node"
 version = "0.1.0"
 dependencies = [

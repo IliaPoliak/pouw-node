@@ -76,6 +76,7 @@ A crate depends only on crates above it in this list.
 | `pouw-consensus` | chain state and diffs, validity rules, `pow`, `difficulty`, `timestamp`, `fork_choice`, `reward` |
 | `pouw-api` | JSON views, error body, paths, events, `NodeClient` |
 | `pouw-light-client` | wallet: keys, nonces, signed transactions |
+| `pouw-light-node` | light node: `/health` and its configuration, header sync follows in #102 |
 | `pouw-node` | node loop, store, mempool, event log, P2P boundary, miner |
 | `pouw-cli` | bin `pouw`: keys, signed transfers, txids, genesis id |
 
