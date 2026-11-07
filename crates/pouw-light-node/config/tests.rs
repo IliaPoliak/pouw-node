@@ -77,3 +77,37 @@ fn a_full_node_must_be_a_base_url() {
         );
     }
 }
+
+#[test]
+fn the_header_store_variables_are_read() {
+    let config = LightConfig::from_vars(vars(&[])).unwrap();
+    assert_eq!(config.data_dir, std::path::PathBuf::from("data"));
+    assert_eq!(config.header_cache, 1024);
+    let config = LightConfig::from_vars(vars(&[
+        (var::DATA_DIR, "/var/lib/pouw-light"),
+        (var::HEADER_CACHE, "16"),
+    ]))
+    .unwrap();
+    assert_eq!(
+        config.data_dir,
+        std::path::PathBuf::from("/var/lib/pouw-light")
+    );
+    assert_eq!(config.header_cache, 16);
+}
+
+#[test]
+fn the_header_cache_must_be_a_positive_number() {
+    for bad in ["0", "-1", "many"] {
+        let error = LightConfig::from_vars(vars(&[(var::HEADER_CACHE, bad)])).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ConfigError::Invalid {
+                    var: var::HEADER_CACHE,
+                    ..
+                }
+            ),
+            "{bad}"
+        );
+    }
+}

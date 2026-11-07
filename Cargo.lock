@@ -602,10 +602,13 @@ name = "pouw-light-node"
 version = "0.1.0"
 dependencies = [
  "pouw-api",
+ "pouw-crypto",
+ "pouw-types",
  "signal-hook",
  "thiserror",
  "tracing",
  "tracing-subscriber",
+ "zerocopy",
 ]
 
 [[package]]
