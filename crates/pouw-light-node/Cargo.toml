@@ -17,7 +17,12 @@ path = "pouw-light-node-main.rs"
 
 [dependencies]
 pouw-api.workspace = true
+pouw-types.workspace = true
 signal-hook.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zerocopy.workspace = true
+
+[dev-dependencies]
+pouw-crypto.workspace = true

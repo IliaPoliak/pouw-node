@@ -5,9 +5,9 @@
 //! Exit codes: 0 after a shutdown signal, 1 when the light node cannot start, 2 for an
 //! invalid configuration.
 
-use std::{env, net::TcpListener, process::ExitCode, thread};
+use std::{env, fs, net::TcpListener, process::ExitCode, thread};
 
-use pouw_light_node::{config::LightConfig, health};
+use pouw_light_node::{config::LightConfig, headers::HeaderStore, health};
 use signal_hook::{
     consts::{SIGINT, SIGTERM},
     iterator::Signals,
@@ -46,6 +46,28 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Err(error) = fs::create_dir_all(&config.data_dir) {
+        error!(%error, dir = %config.data_dir.display(), "cannot create the data directory");
+        return ExitCode::FAILURE;
+    }
+    let headers = match HeaderStore::open(&config.data_dir.join("headers.bin"), config.header_cache)
+    {
+        Ok(headers) => headers,
+        Err(error) => {
+            error!(%error, "cannot open the header store");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some((height, id)) = headers.tip() {
+        info!(
+            height = height.0,
+            %id,
+            stored = headers.len(),
+            "continuing from the last stored header"
+        );
+    } else {
+        info!("the header store is empty");
+    }
     if config.full_nodes.is_empty() {
         warn!("no full node configured, set POUW_FULL_NODES");
     }

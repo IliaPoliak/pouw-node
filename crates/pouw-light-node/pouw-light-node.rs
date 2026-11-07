@@ -6,4 +6,5 @@
 //! `/health`. The header sync and the light API come with pouw-node#102.
 
 pub mod config;
+pub mod headers;
 pub mod health;

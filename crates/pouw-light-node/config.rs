@@ -2,7 +2,11 @@
 //! the full node: every variable has a default and an unknown `POUW_*` variable is an
 //! error, so a typo does not go unnoticed.
 
-use std::net::{AddrParseError, SocketAddr};
+use std::{
+    net::{AddrParseError, SocketAddr},
+    num::ParseIntError,
+    path::PathBuf,
+};
 
 use thiserror::Error;
 
@@ -14,15 +18,30 @@ pub mod var {
     /// `http://node-1:8000`. Default empty: the light node starts and has nothing to
     /// follow.
     pub const FULL_NODES: &str = "POUW_FULL_NODES";
+    /// Directory of the header file. Default `data`.
+    pub const DATA_DIR: &str = "POUW_LIGHT_DATA_DIR";
+    /// Most recent headers kept in memory, at least 1. Default `1024`.
+    pub const HEADER_CACHE: &str = "POUW_LIGHT_HEADER_CACHE";
 }
 
-const KNOWN: [&str; 2] = [var::API_ADDR, var::FULL_NODES];
+const KNOWN: [&str; 4] = [
+    var::API_ADDR,
+    var::FULL_NODES,
+    var::DATA_DIR,
+    var::HEADER_CACHE,
+];
+
+const DEFAULT_HEADER_CACHE: usize = 1024;
 
 const DEFAULT_API_ADDR: &str = "[::]:8000";
 
 /// What is wrong with the value of a variable.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum Reason {
+    #[error("not a positive number: {0}")]
+    Count(String),
+    #[error("not a number: {0}")]
+    Number(#[from] ParseIntError),
     #[error("not a socket address: {0}")]
     Socket(#[from] AddrParseError),
     #[error("not a base url like http://host:port: {0:?}")]
@@ -50,6 +69,10 @@ pub struct LightConfig {
     pub api_addr: SocketAddr,
     /// Base URLs of the full nodes, without a trailing slash.
     pub full_nodes: Vec<String>,
+    /// Directory of the header file.
+    pub data_dir: PathBuf,
+    /// Most recent headers kept in memory.
+    pub header_cache: usize,
 }
 
 impl LightConfig {
@@ -66,10 +89,14 @@ impl LightConfig {
     {
         let mut api_addr = None;
         let mut full_nodes = None;
+        let mut data_dir = None;
+        let mut header_cache = None;
         for (name, value) in vars {
             match name.as_str() {
                 var::API_ADDR => api_addr = Some(value),
                 var::FULL_NODES => full_nodes = Some(value),
+                var::DATA_DIR => data_dir = Some(value),
+                var::HEADER_CACHE => header_cache = Some(value),
                 other if other.starts_with("POUW_") && !KNOWN.contains(&other) => {
                     return Err(ConfigError::Unknown(name));
                 }
@@ -90,9 +117,29 @@ impl LightConfig {
             value: nodes_text.clone(),
             reason,
         })?;
+        let header_cache = match header_cache {
+            None => DEFAULT_HEADER_CACHE,
+            Some(text) => text
+                .parse::<usize>()
+                .map_err(Reason::from)
+                .and_then(|count| {
+                    if count == 0 {
+                        Err(Reason::Count(text.clone()))
+                    } else {
+                        Ok(count)
+                    }
+                })
+                .map_err(|reason| ConfigError::Invalid {
+                    var: var::HEADER_CACHE,
+                    value: text.clone(),
+                    reason,
+                })?,
+        };
         Ok(Self {
             api_addr,
             full_nodes,
+            data_dir: PathBuf::from(data_dir.unwrap_or_else(|| "data".to_owned())),
+            header_cache,
         })
     }
 }
