@@ -80,6 +80,35 @@ pub const DROPPED_COMMANDS: Metric = Metric {
     kind: MetricKind::Counter,
 };
 
+/// Connected blocks, counted when a block extends the tip.
+pub const BLOCKS_CONNECTED: Metric = Metric {
+    name: "pouw_node_blocks_connected_total",
+    help: "Blocks connected on top of the tip.",
+    kind: MetricKind::Counter,
+};
+
+/// Proof txs in the connected blocks, so proofs per block is the rate of this over the
+/// rate of [`BLOCKS_CONNECTED`].
+pub const BLOCK_PROOFS: Metric = Metric {
+    name: "pouw_node_block_proofs_total",
+    help: "Proof transactions in connected blocks.",
+    kind: MetricKind::Counter,
+};
+
+/// Header timestamp of a connected block minus the one of its parent.
+pub const BLOCK_TIME_SECONDS: Metric = Metric {
+    name: "pouw_node_block_time_seconds",
+    help: "Seconds between a connected block and its parent, by header timestamps.",
+    kind: MetricKind::Histogram,
+};
+
+/// Nonces this node tried while mining, the attempts of the lottery.
+pub const LOTTERY_ATTEMPTS: Metric = Metric {
+    name: "pouw_node_lottery_attempts_total",
+    help: "Nonces tried by the miner of this node.",
+    kind: MetricKind::Counter,
+};
+
 /// The metrics every node exports.
 pub const REQUIRED: [Metric; 4] = [HEIGHT, MEMPOOL_SIZE, PEERS, VERIFICATION_DURATION_SECONDS];
 
@@ -102,6 +131,14 @@ pub struct Metrics {
     pub dropped_commands: u64,
     /// [`DROPPED_BLOCKS`].
     pub dropped_blocks: u64,
+    /// [`BLOCKS_CONNECTED`], also the count of [`BLOCK_TIME_SECONDS`].
+    pub blocks_connected: u64,
+    /// [`BLOCK_PROOFS`].
+    pub block_proofs: u64,
+    /// Sum of [`BLOCK_TIME_SECONDS`] in seconds.
+    pub block_time_secs: u64,
+    /// [`LOTTERY_ATTEMPTS`].
+    pub lottery_attempts: u64,
 }
 
 /// The text exposition of every metric of [`REQUIRED`], [`DROPPED_REPLIES`],
@@ -114,6 +151,9 @@ pub fn render(metrics: &Metrics) -> String {
         (DROPPED_REPLIES, metrics.dropped_replies),
         (DROPPED_COMMANDS, metrics.dropped_commands),
         (DROPPED_BLOCKS, metrics.dropped_blocks),
+        (BLOCKS_CONNECTED, metrics.blocks_connected),
+        (BLOCK_PROOFS, metrics.block_proofs),
+        (LOTTERY_ATTEMPTS, metrics.lottery_attempts),
     ]
     .into_iter()
     .map(|(metric, value)| format!("{}{} {value}\n", header(metric), metric.name))
@@ -125,6 +165,14 @@ pub fn render(metrics: &Metrics) -> String {
         name = metric.name,
         count = metrics.verifications,
         sum = metrics.verification_time.as_secs_f64(),
+    ));
+    let metric = BLOCK_TIME_SECONDS;
+    sections.push(format!(
+        "{header}{name}_bucket{{le=\"+Inf\"}} {count}\n{name}_sum {sum}\n{name}_count {count}\n",
+        header = header(metric),
+        name = metric.name,
+        count = metrics.blocks_connected,
+        sum = metrics.block_time_secs,
     ));
     sections.concat()
 }
@@ -173,6 +221,25 @@ mod tests {
         assert!(text.contains("pouw_node_dropped_blocks_total 0\n"));
         assert!(text.contains("pouw_node_verification_duration_seconds_sum 1.5\n"));
         assert!(text.contains("pouw_node_verification_duration_seconds_count 2\n"));
+    }
+
+    #[test]
+    fn the_block_production_metrics_are_rendered() {
+        let metrics = Metrics {
+            blocks_connected: 4,
+            block_proofs: 3,
+            block_time_secs: 40,
+            lottery_attempts: 9000,
+            ..Metrics::default()
+        };
+        let text = render(&metrics);
+        assert!(text.contains("# TYPE pouw_node_blocks_connected_total counter\n"));
+        assert!(text.contains("pouw_node_blocks_connected_total 4\n"));
+        assert!(text.contains("pouw_node_block_proofs_total 3\n"));
+        assert!(text.contains("pouw_node_lottery_attempts_total 9000\n"));
+        assert!(text.contains("# TYPE pouw_node_block_time_seconds histogram\n"));
+        assert!(text.contains("pouw_node_block_time_seconds_sum 40\n"));
+        assert!(text.contains("pouw_node_block_time_seconds_count 4\n"));
     }
 
     #[test]
