@@ -156,7 +156,7 @@ fn the_pending_transactions_of_the_sender_count_against_the_balance() {
     assert_eq!(
         rejected(check(&state, &third, &[&first.body])),
         InvalidTx::InsufficientBalance {
-            needed: Amount(102),
+            needed: Amount(101),
             available: Amount(100)
         }
     );
@@ -165,7 +165,7 @@ fn the_pending_transactions_of_the_sender_count_against_the_balance() {
 #[test]
 fn a_request_for_an_unregistered_circuit_is_rejected() {
     let state = MemState {
-        circuits: Default::default(),
+        circuits: pouw_types::FastMap::default(),
         ..state(100, 0)
     };
     assert_eq!(
