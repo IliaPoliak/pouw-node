@@ -11,9 +11,9 @@ use pouw_api::event::{
     BlockAccepted, BlockOrphaned, BlockRejected, EventKind, TxReceived, TxRejected,
 };
 use pouw_consensus::{
-    Anchor, BlockError, ChainTip, Change, ConsensusParams, HeaderContext, InvalidBlock, InvalidTx,
-    StateDiff, StateError, apply_block, better, check_header, median_time_past, next_target,
-    timestamp::MTP_WINDOW,
+    AdmissionError, Anchor, BlockError, ChainTip, Change, ConsensusParams, HeaderContext,
+    InvalidBlock, InvalidTx, StateDiff, StateError, apply_block, better, check_admission,
+    check_header, median_time_past, next_target, timestamp::MTP_WINDOW,
 };
 use pouw_provers::ProverError;
 use pouw_types::{
@@ -178,16 +178,35 @@ pub fn tx_acceptance(outcome: &TxOutcome) -> Acceptance {
     }
 }
 
-/// Pools a transaction that passed the precheck. The stateful admission check against
-/// the tip state is pouw-node#66; until it exists a transaction passes on the stateless
-/// rules.
+/// Pools a transaction that passed the precheck, after the stateful admission check
+/// (`pouw_consensus::check_admission`, pouw-node#66) against the state at the tip and
+/// the pending transactions of the same sender. A transaction that breaks a rule is
+/// recorded as `tx_rejected` with its txid and answers [`TxOutcome::Invalid`], and the
+/// pool is left unchanged.
 pub fn receive_tx(
+    store: &Store,
+    params: &ConsensusParams,
     mempool: &mut Mempool,
     log: &mut EventLog,
     checked: CheckedTx,
-) -> Result<TxOutcome, SeqExhausted> {
+) -> Result<TxOutcome, ChainFault> {
     let CheckedTx { tx, txid } = checked;
     let (tx_kind, sender, fee) = (tx.body.kind.name(), tx.body.sender, tx.body.fee);
+    let reader = store::read(store)?;
+    let queued = mempool::queued_before(mempool, &sender, tx.body.nonce);
+    match check_admission(params, &reader, &tx, &queued) {
+        Ok(()) => {}
+        Err(AdmissionError::Invalid(invalid)) => {
+            let kind = EventKind::TxRejected(TxRejected {
+                txid: Some(txid),
+                reason_code: invalid.reason_code().to_owned(),
+                message: invalid.to_string(),
+            });
+            events::emit(log, kind)?;
+            return Ok(TxOutcome::Invalid(invalid));
+        }
+        Err(AdmissionError::State(error)) => return Err(error.into()),
+    }
     match mempool::insert(mempool, txid, tx) {
         Ok(id) => {
             let kind = EventKind::TxReceived(TxReceived {

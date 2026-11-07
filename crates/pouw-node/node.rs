@@ -529,7 +529,13 @@ fn on_gossip(
     let topic = message.topic();
     let acceptance = match message {
         Gossip::Tx(tx) => {
-            let outcome = chain::receive_tx(&mut state.mempool, &mut state.events, *tx)?;
+            let outcome = chain::receive_tx(
+                &state.store,
+                &state.params,
+                &mut state.mempool,
+                &mut state.events,
+                *tx,
+            )?;
             chain::tx_acceptance(&outcome)
         }
         Gossip::Announce(announce) => on_announce(state, from, &announce)?,
@@ -798,7 +804,13 @@ fn on_submit_tx(
     let outcome = match checked {
         Ok(checked) => {
             let broadcast = Command::Broadcast(Gossip::Tx(Box::new(checked.clone())));
-            let outcome = chain::receive_tx(&mut state.mempool, &mut state.events, checked)?;
+            let outcome = chain::receive_tx(
+                &state.store,
+                &state.params,
+                &mut state.mempool,
+                &mut state.events,
+                checked,
+            )?;
             if matches!(outcome, TxOutcome::Pooled(_)) {
                 p2p::send(&state.network, broadcast, &mut state.metrics)?;
             }

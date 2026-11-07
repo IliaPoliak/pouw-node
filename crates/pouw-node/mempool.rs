@@ -35,7 +35,7 @@ use std::{
 
 use pouw_api::{event::MempoolSnapshot, view::MempoolView};
 use pouw_crypto::Address;
-use pouw_types::{Amount, CircuitId, FastMap, Nonce, SignedTx, TxId, TxKind, encoded_len};
+use pouw_types::{Amount, CircuitId, FastMap, Nonce, SignedTx, TxBody, TxId, TxKind, encoded_len};
 use thiserror::Error;
 
 /// Most bytes of `verifying_key` and `circuit` together that the node relays and
@@ -297,6 +297,20 @@ pub fn remove_through(pool: &mut Mempool, sender: &Address, nonce: Nonce) -> usi
         .map(|queue| queue.range(..=nonce).map(|(_, id)| *id).collect())
         .unwrap_or_default();
     stale.iter().filter(|id| remove(pool, id).is_some()).count()
+}
+
+/// The bodies of the pending transactions of `sender` with a nonce below `nonce`, in
+/// nonce order. They take their cost from the balance before a transaction with
+/// `nonce` does, see `pouw_consensus::check_admission`.
+pub fn queued_before<'p>(pool: &'p Mempool, sender: &Address, nonce: Nonce) -> Vec<&'p TxBody> {
+    let Some(queue) = pool.senders.get(sender) else {
+        return Vec::new();
+    };
+    queue
+        .range(..nonce)
+        .filter_map(|(_, id)| pool.txs.get(id))
+        .map(|pending| &pending.tx.body)
+        .collect()
 }
 
 pub fn get<'p>(pool: &'p Mempool, id: &TxId) -> Option<&'p SignedTx> {
