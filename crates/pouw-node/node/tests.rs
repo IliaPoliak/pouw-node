@@ -303,10 +303,31 @@ fn put(store: &mut store::Store, block: &Block) -> BlockId {
     id
 }
 
+/// A balance for every test key (the seeds 0 to 255), so that blocks which spend pass the
+/// state transition.
+fn funded() -> StateDiff {
+    let mut diff = StateDiff::default();
+    for seed in 0..=u8::MAX {
+        let address = SigningKey::from_seed([seed; 32]).address();
+        let account = pouw_types::Account {
+            balance: Amount(1_000_000),
+            nonce: Nonce(0),
+        };
+        diff.accounts.insert(
+            address,
+            Change {
+                before: None,
+                after: Some(account),
+            },
+        );
+    }
+    diff
+}
+
 fn with_genesis(h: &mut Harness) -> Block {
     let genesis = genesis_block();
     let id = put(&mut h.state.store, &genesis);
-    store::connect_block(&mut h.state.store, &id, &[], &StateDiff::default()).unwrap();
+    store::connect_block(&mut h.state.store, &id, &[], &funded()).unwrap();
     genesis
 }
 
@@ -1430,7 +1451,7 @@ fn with_circuit(h: &mut Harness) -> Block {
         verifying_key: keys.verifying_key,
         circuit: Box::from(CIRCUIT),
     };
-    let mut diff = StateDiff::default();
+    let mut diff = funded();
     let change = Change {
         before: None,
         after: Some(entry),
