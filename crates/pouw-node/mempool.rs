@@ -291,11 +291,9 @@ pub fn remove(pool: &mut Mempool, id: &TxId) -> Option<SignedTx> {
 /// Removes the pending transactions of `sender` with a nonce up to `nonce`, which a
 /// block of the chain made stale by using that nonce. Returns how many were pending.
 pub fn remove_through(pool: &mut Mempool, sender: &Address, nonce: Nonce) -> usize {
-    let stale: Vec<TxId> = pool
-        .senders
-        .get(sender)
-        .map(|queue| queue.range(..=nonce).map(|(_, id)| *id).collect())
-        .unwrap_or_default();
+    let stale: Vec<TxId> = pool.senders.get(sender).map_or_else(Vec::new, |queue| {
+        queue.range(..=nonce).map(|(_, id)| *id).collect()
+    });
     stale.iter().filter(|id| remove(pool, id).is_some()).count()
 }
 
