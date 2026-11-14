@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod admission;
 pub mod difficulty;
 pub mod fork_choice;
 pub mod pow;
@@ -16,6 +17,7 @@ pub mod timestamp;
 pub mod transition;
 pub mod validation;
 
+pub use admission::{AdmissionError, check_admission, minimum_fee};
 pub use difficulty::{Anchor, DifficultyError, next_target};
 pub use fork_choice::{ChainTip, better};
 pub use pouw_types::ConsensusParams;
