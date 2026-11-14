@@ -305,6 +305,17 @@ pub fn tx_location(reader: &Reader<'_>, id: &TxId) -> Result<Option<TxLocation>,
     }
 }
 
+/// Every circuit of the registry at the tip, ascending by height of registration and
+/// then by id.
+pub fn circuits(reader: &Reader<'_>) -> Result<Vec<CircuitEntry>, StoreError> {
+    match reader {
+        #[cfg(feature = "store-mem")]
+        Reader::Mem(view) => Ok(mem::circuits(view)),
+        #[cfg(feature = "rocksdb")]
+        Reader::Rocks(view) => rocks::circuits(view),
+    }
+}
+
 /// The owned block of `stored`.
 pub fn decode(stored: &BlockBytes<'_>) -> Result<Block, StoreError> {
     borsh::from_slice(&stored.bytes).map_err(StoreError::Decode)

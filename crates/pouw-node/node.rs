@@ -397,6 +397,10 @@ pub enum Flow {
 }
 
 /// Handles one event. [`Flow::Stop`] is the answer to [`Control::Shutdown`] only.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per event and per api request, each a call"
+)]
 pub fn handle(state: &mut NodeState, event: Event) -> Result<Flow, NodeFault> {
     match event {
         Event::Control(Control::Shutdown) => return Ok(Flow::Stop),
@@ -490,6 +494,23 @@ pub fn handle(state: &mut NodeState, event: Event) -> Result<Flow, NodeFault> {
         Event::Api(ApiRequest::Headers { from, to, reply }) => {
             let answer = api::headers(&state.store, from, to);
             reply_to(reply, answer, &mut state.metrics);
+        }
+        Event::Api(ApiRequest::Tx { id, json, reply }) => {
+            let answer = api::tx(&state.store, &state.mempool, &id, json);
+            reply_to(reply, answer, &mut state.metrics);
+        }
+        Event::Api(ApiRequest::Inclusion { id, reply }) => {
+            reply_to(reply, api::inclusion(&state.store, &id), &mut state.metrics);
+        }
+        Event::Api(ApiRequest::Circuits { keys, reply }) => {
+            reply_to(reply, api::circuits(&state.store, keys), &mut state.metrics);
+        }
+        Event::Api(ApiRequest::Circuit { id, keys, reply }) => {
+            reply_to(
+                reply,
+                api::circuit(&state.store, &id, keys),
+                &mut state.metrics,
+            );
         }
         Event::Api(ApiRequest::Metrics { reply }) => {
             let text = metrics::render(&state.metrics);

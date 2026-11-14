@@ -16,11 +16,12 @@
 //!   `node-api.md`, and the JSON view when `Accept` names `application/json`. A list of
 //!   blocks is JSON unless `Accept` names `application/octet-stream`, then the borsh
 //!   blocks follow one another, each prefixed by its u32 length.
-//! - **Node**: the node, head, block, header, blocks, headers, account, mempool and
-//!   events routes and `POST /v1/txs` ask the node loop through the api channel and
-//!   answer from the store, the mempool and the event log. The routes of one
-//!   transaction, its inclusion proof and the circuits answer 501 until pouw-node#81 is
-//!   done. `wait_ms` of the events is not served yet (pouw-node#82).
+//! - **Node**: every route asks the node loop through the api channel and answers from
+//!   the store, the mempool and the event log: node, head, block, header, blocks,
+//!   headers, account, transaction, inclusion proof, circuits, circuit, mempool, events
+//!   and `POST /v1/txs`. A transaction is served from the canonical chain, else from the
+//!   mempool as `pending`; its inclusion proof only once it is in a block. `wait_ms` of
+//!   the events is not served yet (pouw-node#82).
 //!
 //! `/metrics` always asks the node loop, whatever the mode.
 
@@ -68,7 +69,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use crate::{
-    api::{ApiRequest, BlockKey, BlockQuery, BlockReply, Ranged, Refused, submit},
+    api::{ApiRequest, BlockKey, BlockQuery, BlockReply, Ranged, Refused, TxReply, submit},
     chain::TxOutcome,
     events::CursorExpired,
     mempool::MempoolError,
@@ -264,17 +265,6 @@ fn not_found(what: &str) -> Response {
 
 fn malformed(what: &str) -> Response {
     error(ErrorClass::Malformed, code::MALFORMED, what)
-}
-
-fn not_implemented() -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(ErrorBody::new(
-            "not_implemented",
-            "this route is served from fixtures only, set POUW_API_FIXTURES (pouw-node#59)",
-        )),
-    )
-        .into_response()
 }
 
 fn refusal(refused: Refused) -> Response {
@@ -473,7 +463,7 @@ async fn headers(State(app): State<App>, Query(range): Query<Range>) -> Response
 
 async fn tx(State(app): State<App>, UrlPath(key): UrlPath<String>, headers: HeaderMap) -> Response {
     let Some(chain) = app.chain.as_deref() else {
-        return not_implemented();
+        return live_tx(&app, &headers, &key).await;
     };
     let Some(id) = parse::<TxId>(&key) else {
         return malformed("not a tx: id");
@@ -529,7 +519,7 @@ fn pending_tx(app: &App, headers: &HeaderMap, id: TxId) -> Response {
 
 async fn inclusion(State(app): State<App>, UrlPath(key): UrlPath<String>) -> Response {
     let Some(chain) = app.chain.as_deref() else {
-        return not_implemented();
+        return live_inclusion(&app, &key).await;
     };
     let Some(id) = parse::<TxId>(&key) else {
         return malformed("not a tx: id");
@@ -591,7 +581,7 @@ fn circuits_of(chain: &Chain) -> Vec<CircuitEntry> {
 
 async fn circuits(State(app): State<App>, Query(include): Query<Include>) -> Response {
     let Some(chain) = app.chain.as_deref() else {
-        return not_implemented();
+        return live_circuits(&app, &include).await;
     };
     let keys = include.include.as_deref() == Some("keys");
     let entries: Vec<CircuitView> = circuits_of(chain)
@@ -607,7 +597,7 @@ async fn circuit(
     Query(include): Query<Include>,
 ) -> Response {
     let Some(chain) = app.chain.as_deref() else {
-        return not_implemented();
+        return live_circuit(&app, &key, &include).await;
     };
     let Some(id) = parse::<CircuitId>(&key) else {
         return malformed("not a circ: id");
@@ -784,6 +774,54 @@ fn length_prefixed_bytes(items: &[BlockReply]) -> Response {
         out.extend_from_slice(bytes);
     }
     octets(out)
+}
+
+async fn live_tx(app: &App, headers: &HeaderMap, key: &str) -> Response {
+    let Some(id) = parse::<TxId>(key) else {
+        return malformed("not a tx: id");
+    };
+    let json = wants_json(headers);
+    match read(app, |reply| ApiRequest::Tx { id, json, reply }).await {
+        Ok(Some(TxReply::Bytes(bytes))) => octets(bytes),
+        Ok(Some(TxReply::View(view))) => Json(view).into_response(),
+        Ok(None) => not_found("no such transaction"),
+        Err(response) => response,
+    }
+}
+
+async fn live_inclusion(app: &App, key: &str) -> Response {
+    let Some(id) = parse::<TxId>(key) else {
+        return malformed("not a tx: id");
+    };
+    match read(app, |reply| ApiRequest::Inclusion { id, reply }).await {
+        Ok(Some(proof)) => Json(proof).into_response(),
+        Ok(None) => not_found("no such transaction in a block"),
+        Err(response) => response,
+    }
+}
+
+fn wants_keys(include: &Include) -> bool {
+    include.include.as_deref() == Some("keys")
+}
+
+async fn live_circuits(app: &App, include: &Include) -> Response {
+    let keys = wants_keys(include);
+    match read(app, |reply| ApiRequest::Circuits { keys, reply }).await {
+        Ok(entries) => Json(json!({ "circuits": entries })).into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn live_circuit(app: &App, key: &str, include: &Include) -> Response {
+    let Some(id) = parse::<CircuitId>(key) else {
+        return malformed("not a circ: id");
+    };
+    let keys = wants_keys(include);
+    match read(app, |reply| ApiRequest::Circuit { id, keys, reply }).await {
+        Ok(Some(view)) => Json(view).into_response(),
+        Ok(None) => not_found("no such circuit"),
+        Err(response) => response,
+    }
 }
 
 async fn live_node(app: &App) -> Response {

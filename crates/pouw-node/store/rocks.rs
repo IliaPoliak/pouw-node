@@ -293,6 +293,10 @@ pub fn circuit<'v>(view: &'v Db, id: &CircuitId) -> Result<Option<&'v CircuitEnt
     Ok(view.circuits.get(id))
 }
 
+pub fn circuits(view: &Db) -> Result<Vec<CircuitEntry>, StoreError> {
+    match *view {}
+}
+
 pub fn usage_counter(
     view: &Db,
     miner: &Address,

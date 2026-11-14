@@ -1,14 +1,17 @@
 use std::{cell::Cell, collections::VecDeque, time::Duration};
 
-use pouw_api::{event::EventKind, view::HeaderView};
+use pouw_api::{
+    event::EventKind,
+    view::{HeaderView, TxStatus},
+};
 use pouw_consensus::{Anchor, Change, InvalidTx, Scratch, StateDiff, next_target};
 use pouw_crypto::{Address, Hash32, SigningKey};
 use pouw_provers::{MockProver, Prover, Statement};
 use pouw_types::{
     Amount, Block, BlockHeader, BlockId, ChainId, CircuitEntry, CircuitId, ConsensusParams,
     ConstraintCount, CumWork, Height, Nonce, ProofSystem, SignedTx, SystemId, Target, Timestamp,
-    TxBody, TxId, TxKind, U32, U64, UsageCounter, block_id, block_work, eta_chain, mask, sign_body,
-    txid,
+    TxBody, TxId, TxKind, U32, U64, UsageCounter, block_id, block_work, eta_chain, mask,
+    proof_tx_hash, sign_body, txid, verify_inclusion,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -16,7 +19,7 @@ use tokio::{
 };
 
 use crate::{
-    api::{self, ApiRequest, BlockKey, BlockQuery, BlockReply, Ranged},
+    api::{self, ApiRequest, BlockKey, BlockQuery, BlockReply, Ranged, TxReply},
     chain::{self, TxOutcome},
     events::{self, EventLog},
     mempool::{self, MempoolLimits},
@@ -2013,4 +2016,115 @@ fn post_txs_runs_the_admission_check_against_the_state_of_the_node() {
     assert_eq!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(answer["error"]["code"], "bad_nonce");
     assert!(h.state.mempool.txs.is_empty());
+}
+
+/// Asks the loop one question and returns its answer.
+fn ask_api<T>(h: &mut Harness, request: impl FnOnce(oneshot::Sender<T>) -> ApiRequest) -> T {
+    let (reply, mut answer) = oneshot::channel();
+    to_api(h, request(reply));
+    run(h);
+    answer.try_recv().unwrap()
+}
+
+#[test]
+fn a_tx_its_inclusion_proof_and_the_circuits_are_served_from_the_store() {
+    let mut h = harness();
+    with_circuit(&mut h);
+    h.state.miner = Some(MINER);
+    let request = proof_request(1, 0);
+    pool(&mut h, request.clone());
+    mine_to(&mut h, 1);
+    h.state.miner = None;
+    let mined = canonical_blocks(&h, 1..=1).remove(0);
+    let included = txid(&request);
+    let queued = proof_request(2, 0);
+    let queued_id = txid(&queued);
+    pool(&mut h, queued.clone());
+    let unknown = TxId(Hash32([0xee; 32]));
+    let at = mined.txs.len();
+    let leaf = u32::try_from(at).unwrap();
+
+    let tx = |h: &mut Harness, id: TxId, json: bool| {
+        ask_api(h, |reply| ApiRequest::Tx { id, json, reply }).unwrap()
+    };
+    // an included proof request: its bytes, then the view with the fields of its proof tx
+    assert_eq!(
+        tx(&mut h, included, false),
+        Some(TxReply::Bytes(borsh::to_vec(&request).unwrap()))
+    );
+    let Some(TxReply::View(view)) = tx(&mut h, included, true) else {
+        panic!("the included tx is not a view");
+    };
+    assert!(matches!(view.status, TxStatus::Included));
+    assert_eq!(
+        (view.txid, view.height, view.index),
+        (included, Some(Height(1)), Some(leaf))
+    );
+    let proof = view.proof.expect("an included proof request has its proof");
+    let stored = &mined.proof_txs[0];
+    assert_eq!(proof.proof_hash, proof_tx_hash(stored));
+    assert_eq!(proof.usage_counter, stored.usage_counter);
+    assert_eq!(proof.proof, stored.proof);
+    assert_eq!(proof.proof_system, h.prover.id());
+    // a queued one is pending, in both forms, and an unknown one is nothing
+    let Some(TxReply::View(view)) = tx(&mut h, queued_id, true) else {
+        panic!("the pending tx is not a view");
+    };
+    assert!(matches!(view.status, TxStatus::Pending));
+    assert_eq!((view.height, view.index), (None, None));
+    assert!(view.proof.is_none());
+    assert_eq!(
+        tx(&mut h, queued_id, false),
+        Some(TxReply::Bytes(borsh::to_vec(&queued).unwrap()))
+    );
+    assert_eq!(tx(&mut h, unknown, true), None);
+
+    // the inclusion proof verifies against the header of the block
+    let inclusion = |h: &mut Harness, id: TxId| {
+        ask_api(h, |reply| ApiRequest::Inclusion { id, reply }).unwrap()
+    };
+    let path = inclusion(&mut h, included).expect("an included tx has an inclusion proof");
+    let leaves = mined.leaf_ids();
+    assert_eq!(
+        (path.height, path.index, path.leaf_count),
+        (Height(1), leaf, u32::try_from(leaves.len()).unwrap())
+    );
+    assert!(verify_inclusion(
+        &mined.header.tx_root,
+        &leaves[at],
+        path.index,
+        path.leaf_count,
+        &path.siblings
+    ));
+    assert_eq!(inclusion(&mut h, queued_id), None);
+    assert_eq!(inclusion(&mut h, unknown), None);
+
+    // the registry: the one circuit, without and with its blobs
+    let circuits = |h: &mut Harness, keys: bool| {
+        ask_api(h, |reply| ApiRequest::Circuits { keys, reply }).unwrap()
+    };
+    let [entry] = circuits(&mut h, false).try_into().unwrap_or_else(|_| {
+        panic!("one circuit is registered");
+    });
+    assert_eq!((entry.id, entry.registered_at), (circuit_id(), Height(0)));
+    assert!(entry.verifying_key.is_none() && entry.circuit.is_none());
+    let [keyed] = circuits(&mut h, true).try_into().unwrap_or_else(|_| {
+        panic!("one circuit is registered");
+    });
+    assert_eq!(keyed.circuit.as_deref(), Some(CIRCUIT));
+    let one = ask_api(&mut h, |reply| ApiRequest::Circuit {
+        id: circuit_id(),
+        keys: true,
+        reply,
+    })
+    .unwrap()
+    .expect("the circuit is registered");
+    assert_eq!(one, keyed);
+    let missing = ask_api(&mut h, |reply| ApiRequest::Circuit {
+        id: CircuitId(unknown),
+        keys: false,
+        reply,
+    })
+    .unwrap();
+    assert_eq!(missing, None);
 }
