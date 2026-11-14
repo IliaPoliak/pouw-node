@@ -8,8 +8,14 @@
 //!   `POST /v1/txs` are answered from the fixture chain. This is the mock node for the
 //!   indexer, the workload generator and the web API (pouw-node#59). Accounts are
 //!   mocked: every address that appears in the chain has [`MOCK_BALANCE`] and the nonce
-//!   it has in the chain. A submitted transaction is checked and acknowledged, not
-//!   stored.
+//!   it has in the chain. A submitted transaction is checked and kept in memory as
+//!   pending, never included in a block, so `GET /v1/txs/{txid}` answers `pending` and
+//!   `GET /v1/mempool` lists it.
+//!
+//!   The GETs of a block, a header and a tx answer borsh, the default of
+//!   `node-api.md`, and the JSON view when `Accept` names `application/json`. A list of
+//!   blocks is JSON unless `Accept` names `application/octet-stream`, then the borsh
+//!   blocks follow one another, each prefixed by its u32 length.
 //! - **Node**: only `/health` is served; the other routes answer 501 until they are
 //!   wired to the node loop through the api channel.
 //!
@@ -17,7 +23,13 @@
 
 #![allow(clippy::needless_pass_by_value, clippy::unused_async)]
 
-use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    net::SocketAddr,
+    path::Path,
+    sync::{Arc, Mutex, PoisonError},
+    time::Duration,
+};
 
 use axum::{
     Json, Router,
@@ -39,8 +51,8 @@ use pouw_api::{
 };
 use pouw_crypto::Address;
 use pouw_types::{
-    Amount, BlockId, ChainId, CircuitEntry, CircuitId, Height, Nonce, SignedTx, TxId, TxKind,
-    inclusion_proof, txid, verify_tx,
+    Amount, Block, BlockHeader, BlockId, ChainId, CircuitEntry, CircuitId, Height, Nonce, ProofTx,
+    SignedTx, TxId, TxKind, inclusion_proof, txid, verify_tx,
 };
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -57,6 +69,12 @@ pub const MOCK_BALANCE: u64 = 1_000_000;
 
 /// How long `/metrics` waits for the node loop.
 const METRICS_WAIT: Duration = Duration::from_secs(5);
+
+/// Most transactions the mock keeps as pending, a submission over it answers 503.
+const MAX_PENDING: usize = 4096;
+
+/// The transactions submitted to the mock, by txid.
+type PendingTxs = Arc<Mutex<BTreeMap<TxId, SignedTx>>>;
 
 /// The chain of `chain.json`.
 #[derive(Debug)]
@@ -194,6 +212,7 @@ struct Found<'a> {
 struct App {
     chain: Option<Arc<Chain>>,
     api: mpsc::Sender<ApiRequest>,
+    pending: PendingTxs,
 }
 
 #[derive(Deserialize)]
@@ -246,6 +265,85 @@ fn refusal(refused: Refused) -> Response {
     error(ErrorClass::Busy, code::BUSY, &refused.to_string())
 }
 
+fn internal(what: &str) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorBody::new("internal", what)),
+    )
+        .into_response()
+}
+
+/// Whether `Accept` names `media`, parameters such as `q=` ignored.
+fn accepts(headers: &HeaderMap, media: &str) -> bool {
+    headers
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|item| item.split(';').next())
+        .any(|item| item.trim().eq_ignore_ascii_case(media))
+}
+
+/// A block, header or tx GET: borsh unless the client asks for the JSON view, the
+/// default of `node-api.md`.
+fn wants_json(headers: &HeaderMap) -> bool {
+    accepts(headers, "application/json")
+}
+
+fn octets(bytes: Vec<u8>) -> Response {
+    ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response()
+}
+
+/// The borsh answer for `value`.
+fn borsh_of<T: borsh::BorshSerialize>(value: &T) -> Response {
+    match borsh::to_vec(value) {
+        Ok(bytes) => octets(bytes),
+        Err(e) => internal(&e.to_string()),
+    }
+}
+
+/// The block `view` shows, rebuilt from the signed parts the view carries.
+fn block_of(view: &BlockView) -> Block {
+    Block {
+        header: view.header,
+        txs: view.txs.iter().map(|tx| tx.tx.clone()).collect(),
+        proof_txs: view
+            .proof_txs
+            .iter()
+            .map(|proof| ProofTx {
+                request: proof.request.tx.clone(),
+                usage_counter: proof.usage_counter,
+                proof: proof.proof.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// The borsh blocks of `window` one after another, each prefixed by its length as a
+/// little-endian u32.
+fn length_prefixed(window: &[BlockView]) -> Response {
+    let mut out = Vec::new();
+    for view in window {
+        let Ok(bytes) = borsh::to_vec(&block_of(view)) else {
+            return internal("cannot encode a block");
+        };
+        let Ok(len) = u32::try_from(bytes.len()) else {
+            return internal("a block is over the u32 length prefix");
+        };
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&bytes);
+    }
+    octets(out)
+}
+
+fn header_answer(headers: &HeaderMap, value: &BlockHeader) -> Response {
+    if wants_json(headers) {
+        Json(HeaderView::from(value)).into_response()
+    } else {
+        borsh_of(value)
+    }
+}
+
 // ---------------------------------------------------------------- handlers
 
 async fn health() -> Json<Value> {
@@ -287,38 +385,52 @@ async fn node_info(State(app): State<App>) -> Response {
     .into_response()
 }
 
-async fn head(State(app): State<App>) -> Response {
+async fn head(State(app): State<App>, headers: HeaderMap) -> Response {
     let Some(chain) = app.chain.as_deref() else {
         return not_implemented();
     };
-    Json(HeaderView::from(&chain.tip().header)).into_response()
+    header_answer(&headers, &chain.tip().header)
 }
 
-async fn block(State(app): State<App>, UrlPath(key): UrlPath<String>) -> Response {
-    let Some(chain) = app.chain.as_deref() else {
-        return not_implemented();
-    };
-    match chain.block(&key) {
-        Some(block) => Json(block).into_response(),
-        None => not_found("no such block"),
-    }
-}
-
-async fn block_header(State(app): State<App>, UrlPath(key): UrlPath<String>) -> Response {
+async fn block(
+    State(app): State<App>,
+    UrlPath(key): UrlPath<String>,
+    headers: HeaderMap,
+) -> Response {
     let Some(chain) = app.chain.as_deref() else {
         return not_implemented();
     };
     match chain.block(&key) {
-        Some(block) => Json(HeaderView::from(&block.header)).into_response(),
+        Some(block) if wants_json(&headers) => Json(block).into_response(),
+        Some(block) => borsh_of(&block_of(block)),
         None => not_found("no such block"),
     }
 }
 
-async fn blocks(State(app): State<App>, Query(range): Query<Range>) -> Response {
+async fn block_header(
+    State(app): State<App>,
+    UrlPath(key): UrlPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(chain) = app.chain.as_deref() else {
+        return not_implemented();
+    };
+    match chain.block(&key) {
+        Some(block) => header_answer(&headers, &block.header),
+        None => not_found("no such block"),
+    }
+}
+
+async fn blocks(
+    State(app): State<App>,
+    Query(range): Query<Range>,
+    headers: HeaderMap,
+) -> Response {
     let Some(chain) = app.chain.as_deref() else {
         return not_implemented();
     };
     match chain.window(&range, MAX_BLOCKS_PER_CALL) {
+        Ok(window) if accepts(&headers, "application/octet-stream") => length_prefixed(window),
         Ok(window) => Json(BlocksPage {
             blocks: window.to_vec(),
         })
@@ -343,7 +455,7 @@ async fn headers(State(app): State<App>, Query(range): Query<Range>) -> Response
     }
 }
 
-async fn tx(State(app): State<App>, UrlPath(key): UrlPath<String>) -> Response {
+async fn tx(State(app): State<App>, UrlPath(key): UrlPath<String>, headers: HeaderMap) -> Response {
     let Some(chain) = app.chain.as_deref() else {
         return not_implemented();
     };
@@ -351,8 +463,11 @@ async fn tx(State(app): State<App>, UrlPath(key): UrlPath<String>) -> Response {
         return malformed("not a tx: id");
     };
     let Some(found) = chain.find(&id) else {
-        return not_found("no such transaction");
+        return pending_tx(&app, &headers, id);
     };
+    if !wants_json(&headers) {
+        return borsh_of(&found.tx.tx);
+    }
     Json(TxView {
         txid: id,
         status: TxStatus::Included,
@@ -367,6 +482,31 @@ async fn tx(State(app): State<App>, UrlPath(key): UrlPath<String>) -> Response {
             proof: proof.proof.clone(),
             proof_hash: proof.proof_hash,
         }),
+    })
+    .into_response()
+}
+
+/// A transaction the chain does not hold: pending when it was submitted to the mock.
+fn pending_tx(app: &App, headers: &HeaderMap, id: TxId) -> Response {
+    let pending = app
+        .pending
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&id)
+        .cloned();
+    let Some(tx) = pending else {
+        return not_found("no such transaction");
+    };
+    if !wants_json(headers) {
+        return borsh_of(&tx);
+    }
+    Json(TxView {
+        txid: id,
+        status: TxStatus::Pending,
+        tx: SignedTxView::from(&tx),
+        height: None,
+        index: None,
+        proof: None,
     })
     .into_response()
 }
@@ -496,10 +636,15 @@ async fn mempool(State(app): State<App>) -> Response {
     if app.chain.is_none() {
         return not_implemented();
     }
+    let pending = app.pending.lock().unwrap_or_else(PoisonError::into_inner);
+    let requests = pending
+        .values()
+        .filter(|tx| matches!(tx.body.kind, TxKind::ProofRequest { .. }))
+        .count();
     Json(MempoolView {
-        tx_count: 0,
-        proof_request_count: 0,
-        txids: Vec::new(),
+        tx_count: u32::try_from(pending.len()).unwrap_or(u32::MAX),
+        proof_request_count: u32::try_from(requests).unwrap_or(u32::MAX),
+        txids: pending.keys().copied().collect(),
     })
     .into_response()
 }
@@ -535,7 +680,7 @@ async fn events(State(app): State<App>, Query(query): Query<EventsQuery>) -> Res
     Json(EventsPage { events, next }).into_response()
 }
 
-/// Checks the signature and acknowledges; nothing is stored.
+/// Checks the signature, keeps the transaction as pending in memory and acknowledges.
 async fn submit_tx(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Response {
     if app.chain.is_none() {
         return not_implemented();
@@ -556,11 +701,19 @@ async fn submit_tx(State(app): State<App>, headers: HeaderMap, body: Bytes) -> R
     if let Err(reason) = verify_tx(&tx) {
         return error(ErrorClass::Rejected, "invalid_tx", &reason.to_string());
     }
-    (
-        StatusCode::ACCEPTED,
-        Json(SubmitTxResponse { txid: txid(&tx) }),
-    )
-        .into_response()
+    let id = txid(&tx);
+    let included = app
+        .chain
+        .as_deref()
+        .is_some_and(|chain| chain.find(&id).is_some());
+    if !included {
+        let mut pending = app.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        if pending.len() >= MAX_PENDING && !pending.contains_key(&id) {
+            return error(ErrorClass::Busy, code::BUSY, "the mock mempool is full");
+        }
+        pending.insert(id, tx);
+    }
+    (StatusCode::ACCEPTED, Json(SubmitTxResponse { txid: id })).into_response()
 }
 
 // ------------------------------------------------------------------ servers
@@ -620,6 +773,7 @@ pub fn serve_api(
         api_router(App {
             chain,
             api: api.clone(),
+            pending: PendingTxs::default(),
         }),
     )
 }
@@ -634,6 +788,10 @@ pub fn serve_metrics(
         metrics_router(App {
             chain: None,
             api: api.clone(),
+            pending: PendingTxs::default(),
         }),
     )
 }
+
+#[cfg(test)]
+mod tests;
