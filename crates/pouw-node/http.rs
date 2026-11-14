@@ -16,12 +16,19 @@
 //!   `node-api.md`, and the JSON view when `Accept` names `application/json`. A list of
 //!   blocks is JSON unless `Accept` names `application/octet-stream`, then the borsh
 //!   blocks follow one another, each prefixed by its u32 length.
-//! - **Node**: only `/health` is served; the other routes answer 501 until they are
-//!   wired to the node loop through the api channel.
+//! - **Node**: the node, head, block, header, blocks, headers, account, mempool and
+//!   events routes and `POST /v1/txs` ask the node loop through the api channel and
+//!   answer from the store, the mempool and the event log. The routes of one
+//!   transaction, its inclusion proof and the circuits answer 501 until pouw-node#81 is
+//!   done. `wait_ms` of the events is not served yet (pouw-node#82).
 //!
 //! `/metrics` always asks the node loop, whatever the mode.
 
-#![allow(clippy::needless_pass_by_value, clippy::unused_async)]
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_async,
+    clippy::result_large_err
+)]
 
 use std::{
     collections::BTreeMap,
@@ -40,7 +47,7 @@ use axum::{
     routing::{get, post},
 };
 use pouw_api::{
-    error::{ErrorBody, ErrorClass, code},
+    error::{ErrorBody, ErrorClass, ErrorDetail, ErrorDetails, code},
     event::{BlockAccepted, Event, EventKind, EventTime, EventsPage, NodeId},
     path,
     view::{
@@ -49,19 +56,25 @@ use pouw_api::{
         ProofTxView, SignedTxView, SubmitTxResponse, TxStatus, TxView,
     },
 };
+use pouw_consensus::Scratch;
 use pouw_crypto::Address;
 use pouw_types::{
     Amount, Block, BlockHeader, BlockId, ChainId, CircuitEntry, CircuitId, Height, Nonce, ProofTx,
     SignedTx, TxId, TxKind, inclusion_proof, txid, verify_tx,
 };
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
-    api::{ApiRequest, Refused, submit},
+    api::{ApiRequest, BlockKey, BlockQuery, BlockReply, Ranged, Refused, submit},
+    chain::TxOutcome,
+    events::CursorExpired,
+    mempool::MempoolError,
     node::ComponentFault,
+    precheck::check_tx,
+    store::StoreError,
 };
 
 /// The balance every address of the fixture chain has in fixtures mode.
@@ -69,6 +82,9 @@ pub const MOCK_BALANCE: u64 = 1_000_000;
 
 /// How long `/metrics` waits for the node loop.
 const METRICS_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a route waits for the node loop.
+const ASK_WAIT: Duration = Duration::from_secs(5);
 
 /// Most transactions the mock keeps as pending, a submission over it answers 503.
 const MAX_PENDING: usize = 4096;
@@ -374,7 +390,7 @@ async fn metrics(State(app): State<App>) -> Response {
 
 async fn node_info(State(app): State<App>) -> Response {
     let Some(chain) = app.chain.as_deref() else {
-        return not_implemented();
+        return live_node(&app).await;
     };
     Json(NodeInfo {
         chain_id: chain.chain_id,
@@ -387,7 +403,7 @@ async fn node_info(State(app): State<App>) -> Response {
 
 async fn head(State(app): State<App>, headers: HeaderMap) -> Response {
     let Some(chain) = app.chain.as_deref() else {
-        return not_implemented();
+        return live_header(&app, &headers, Some(BlockKey::Head)).await;
     };
     header_answer(&headers, &chain.tip().header)
 }
@@ -398,7 +414,7 @@ async fn block(
     headers: HeaderMap,
 ) -> Response {
     let Some(chain) = app.chain.as_deref() else {
-        return not_implemented();
+        return live_block(&app, &headers, block_key(&key)).await;
     };
     match chain.block(&key) {
         Some(block) if wants_json(&headers) => Json(block).into_response(),
@@ -413,7 +429,7 @@ async fn block_header(
     headers: HeaderMap,
 ) -> Response {
     let Some(chain) = app.chain.as_deref() else {
-        return not_implemented();
+        return live_header(&app, &headers, block_key(&key)).await;
     };
     match chain.block(&key) {
         Some(block) => header_answer(&headers, &block.header),
@@ -427,7 +443,7 @@ async fn blocks(
     headers: HeaderMap,
 ) -> Response {
     let Some(chain) = app.chain.as_deref() else {
-        return not_implemented();
+        return live_blocks(&app, &range, &headers).await;
     };
     match chain.window(&range, MAX_BLOCKS_PER_CALL) {
         Ok(window) if accepts(&headers, "application/octet-stream") => length_prefixed(window),
@@ -441,7 +457,7 @@ async fn blocks(
 
 async fn headers(State(app): State<App>, Query(range): Query<Range>) -> Response {
     let Some(chain) = app.chain.as_deref() else {
-        return not_implemented();
+        return live_headers(&app, &range).await;
     };
     match chain.window(&range, MAX_HEADERS_PER_CALL) {
         Ok(window) => Json(HeadersPage {
@@ -605,7 +621,7 @@ async fn circuit(
 
 async fn account(State(app): State<App>, UrlPath(key): UrlPath<String>) -> Response {
     let Some(chain) = app.chain.as_deref() else {
-        return not_implemented();
+        return live_account(&app, &key).await;
     };
     let Some(address) = parse::<Address>(&key) else {
         return malformed("not an addr: address");
@@ -634,7 +650,7 @@ async fn account(State(app): State<App>, UrlPath(key): UrlPath<String>) -> Respo
 
 async fn mempool(State(app): State<App>) -> Response {
     if app.chain.is_none() {
-        return not_implemented();
+        return live_mempool(&app).await;
     }
     let pending = app.pending.lock().unwrap_or_else(PoisonError::into_inner);
     let requests = pending
@@ -653,7 +669,7 @@ async fn mempool(State(app): State<App>) -> Response {
 /// long-poll: the answer is immediate.
 async fn events(State(app): State<App>, Query(query): Query<EventsQuery>) -> Response {
     let Some(chain) = app.chain.as_deref() else {
-        return not_implemented();
+        return live_events(&app, &query).await;
     };
     let after = query.after.unwrap_or(0);
     let limit = usize::try_from(query.limit.unwrap_or(100).clamp(1, 1000)).unwrap_or(100);
@@ -683,18 +699,9 @@ async fn events(State(app): State<App>, Query(query): Query<EventsQuery>) -> Res
 /// Checks the signature, keeps the transaction as pending in memory and acknowledges.
 async fn submit_tx(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Response {
     if app.chain.is_none() {
-        return not_implemented();
+        return live_submit(&app, &headers, &body).await;
     }
-    let json = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with("application/json"));
-    let decoded: Result<SignedTx, String> = if json {
-        serde_json::from_slice(&body).map_err(|e| e.to_string())
-    } else {
-        borsh::from_slice(&body).map_err(|e| e.to_string())
-    };
-    let tx = match decoded {
+    let tx = match decode_tx(&headers, &body) {
         Ok(tx) => tx,
         Err(reason) => return malformed(&reason),
     };
@@ -714,6 +721,257 @@ async fn submit_tx(State(app): State<App>, headers: HeaderMap, body: Bytes) -> R
         pending.insert(id, tx);
     }
     (StatusCode::ACCEPTED, Json(SubmitTxResponse { txid: id })).into_response()
+}
+
+// ------------------------------------------------------------ node mode
+
+/// Asks the node loop and waits for the answer, at most [`ASK_WAIT`]. A full queue is a
+/// 503, and so is a loop that does not answer in time.
+async fn ask<T>(
+    app: &App,
+    request: impl FnOnce(oneshot::Sender<T>) -> ApiRequest,
+) -> Result<T, Response> {
+    let (reply, answer) = oneshot::channel();
+    submit(&app.api, request(reply)).map_err(refusal)?;
+    match tokio::time::timeout(ASK_WAIT, answer).await {
+        Ok(Ok(value)) => Ok(value),
+        _ => Err(error(
+            ErrorClass::Busy,
+            code::BUSY,
+            "the node did not answer in time",
+        )),
+    }
+}
+
+/// [`ask`] for a read of the store: a failed read is a 500 and is logged, not shown.
+async fn read<T>(
+    app: &App,
+    request: impl FnOnce(oneshot::Sender<Result<T, StoreError>>) -> ApiRequest,
+) -> Result<T, Response> {
+    ask(app, request).await?.map_err(|fault| {
+        warn!(%fault, "the store failed an API read");
+        internal("the store cannot be read")
+    })
+}
+
+fn json_or<T: Serialize>(result: Result<T, Response>) -> Response {
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err(response) => response,
+    }
+}
+
+/// A decimal height or a `blk:` id.
+fn block_key(text: &str) -> Option<BlockKey> {
+    if let Ok(height) = text.parse::<u64>() {
+        return Some(BlockKey::Height(Height(height)));
+    }
+    parse::<BlockId>(text).map(BlockKey::Id)
+}
+
+/// The borsh blocks one after another, each prefixed by its length as a little-endian
+/// u32, the format of [`length_prefixed`].
+fn length_prefixed_bytes(items: &[BlockReply]) -> Response {
+    let mut out = Vec::new();
+    for item in items {
+        let BlockReply::Bytes(bytes) = item else {
+            return internal("a block came back as a view");
+        };
+        let Ok(len) = u32::try_from(bytes.len()) else {
+            return internal("a block is over the u32 length prefix");
+        };
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(bytes);
+    }
+    octets(out)
+}
+
+async fn live_node(app: &App) -> Response {
+    json_or(read(app, |reply| ApiRequest::Node { reply }).await)
+}
+
+async fn live_header(app: &App, headers: &HeaderMap, key: Option<BlockKey>) -> Response {
+    let Some(key) = key else {
+        return not_found("no such block");
+    };
+    match read(app, |reply| ApiRequest::CanonicalHeader { key, reply }).await {
+        Ok(Some(view)) => header_answer(headers, &view.header),
+        Ok(None) => not_found("no such block"),
+        Err(response) => response,
+    }
+}
+
+async fn live_block(app: &App, headers: &HeaderMap, key: Option<BlockKey>) -> Response {
+    let Some(key) = key else {
+        return not_found("no such block");
+    };
+    let json = wants_json(headers);
+    let request = |reply| ApiRequest::CanonicalBlock(Box::new(BlockQuery { key, json, reply }));
+    match read(app, request).await {
+        Ok(Some(BlockReply::Bytes(bytes))) => octets(bytes),
+        Ok(Some(BlockReply::View(view))) => Json(view).into_response(),
+        Ok(None) => not_found("no such block"),
+        Err(response) => response,
+    }
+}
+
+fn range_error(what: &Ranged<()>) -> Response {
+    match what {
+        Ranged::FromAboveTo => malformed("from is above to"),
+        _ => error(
+            ErrorClass::Rejected,
+            code::RANGE_TOO_LARGE,
+            "the range is over the cap of one call",
+        ),
+    }
+}
+
+async fn live_blocks(app: &App, range: &Range, headers: &HeaderMap) -> Response {
+    let octet = accepts(headers, "application/octet-stream");
+    let request = |reply| ApiRequest::Blocks {
+        from: range.from,
+        to: range.to,
+        json: !octet,
+        reply,
+    };
+    match read(app, request).await {
+        Ok(Ranged::Items(items)) if octet => length_prefixed_bytes(&items),
+        Ok(Ranged::Items(items)) => {
+            let blocks = items
+                .into_iter()
+                .filter_map(|item| match item {
+                    BlockReply::View(view) => Some(*view),
+                    BlockReply::Bytes(_) => None,
+                })
+                .collect();
+            Json(BlocksPage { blocks }).into_response()
+        }
+        Ok(Ranged::FromAboveTo) => range_error(&Ranged::FromAboveTo),
+        Ok(Ranged::TooLarge) => range_error(&Ranged::TooLarge),
+        Err(response) => response,
+    }
+}
+
+async fn live_headers(app: &App, range: &Range) -> Response {
+    let request = |reply| ApiRequest::Headers {
+        from: range.from,
+        to: range.to,
+        reply,
+    };
+    match read(app, request).await {
+        Ok(Ranged::Items(headers)) => Json(HeadersPage { headers }).into_response(),
+        Ok(Ranged::FromAboveTo) => range_error(&Ranged::FromAboveTo),
+        Ok(Ranged::TooLarge) => range_error(&Ranged::TooLarge),
+        Err(response) => response,
+    }
+}
+
+async fn live_account(app: &App, key: &str) -> Response {
+    let Some(address) = parse::<Address>(key) else {
+        return malformed("not an addr: address");
+    };
+    match read(app, |reply| ApiRequest::Account { address, reply }).await {
+        Ok(Some(view)) => Json(view).into_response(),
+        Ok(None) => not_found("the chain has not seen this address"),
+        Err(response) => response,
+    }
+}
+
+async fn live_mempool(app: &App) -> Response {
+    json_or(ask(app, |reply| ApiRequest::Mempool { reply }).await)
+}
+
+/// 410 with the oldest retained `seq`, the body `node-events.md` gives an expired cursor.
+fn cursor_expired(expired: CursorExpired) -> Response {
+    let body = ErrorBody {
+        error: ErrorDetail {
+            code: code::CURSOR_EXPIRED.to_owned(),
+            message: expired.to_string(),
+            details: Some(ErrorDetails {
+                oldest_seq: Some(expired.oldest_seq),
+            }),
+        },
+    };
+    (StatusCode::GONE, Json(body)).into_response()
+}
+
+/// A page of the event log. There is no long poll yet: the answer is immediate.
+async fn live_events(app: &App, query: &EventsQuery) -> Response {
+    let after = query.after.unwrap_or(0);
+    let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    match ask(app, |reply| ApiRequest::Events {
+        after,
+        limit,
+        reply,
+    })
+    .await
+    {
+        Ok(Ok(page)) => Json(page).into_response(),
+        Ok(Err(expired)) => cursor_expired(expired),
+        Err(response) => response,
+    }
+}
+
+/// The body of `POST /v1/txs`: borsh, or JSON when the content type says so.
+fn decode_tx(headers: &HeaderMap, body: &Bytes) -> Result<SignedTx, String> {
+    let json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    if json {
+        serde_json::from_slice(body).map_err(|e| e.to_string())
+    } else {
+        borsh::from_slice(body).map_err(|e| e.to_string())
+    }
+}
+
+fn accepted(id: TxId) -> Response {
+    (StatusCode::ACCEPTED, Json(SubmitTxResponse { txid: id })).into_response()
+}
+
+/// A transaction the mempool does not take. A resubmission is accepted again, a pool that
+/// is full is a 503, a transaction that can never fit or pay enough is a 422.
+fn mempool_refusal(refused: &MempoolError) -> Response {
+    let message = refused.to_string();
+    match refused {
+        MempoolError::Duplicate(id) => accepted(*id),
+        MempoolError::Full { .. }
+        | MempoolError::TooMany { .. }
+        | MempoolError::SenderFull { .. } => error(ErrorClass::Busy, code::BUSY, &message),
+        MempoolError::Underpriced { .. } => error(ErrorClass::Rejected, "underpriced", &message),
+        MempoolError::OverRelayCap { .. } | MempoolError::Oversized { .. } => {
+            error(ErrorClass::Rejected, "over_limit", &message)
+        }
+    }
+}
+
+/// Decodes the transaction, runs the stateless checks on this thread and hands the
+/// verdict to the node loop, which pools it and gossips it.
+async fn live_submit(app: &App, headers: &HeaderMap, body: &Bytes) -> Response {
+    let tx = match decode_tx(headers, body) {
+        Ok(tx) => tx,
+        Err(reason) => return malformed(&reason),
+    };
+    let chain_id = match read(app, |reply| ApiRequest::Node { reply }).await {
+        Ok(info) => info.chain_id,
+        Err(response) => return response,
+    };
+    let checked = check_tx(tx, chain_id, &mut Scratch::default());
+    let outcome = ask(app, |reply| ApiRequest::SubmitTx {
+        checked: Box::new(checked),
+        reply,
+    })
+    .await;
+    match outcome {
+        Ok(TxOutcome::Pooled(id)) => accepted(id),
+        Ok(TxOutcome::Invalid(invalid)) => error(
+            ErrorClass::Rejected,
+            invalid.reason_code(),
+            &invalid.to_string(),
+        ),
+        Ok(TxOutcome::Refused(refused)) => mempool_refusal(&refused),
+        Err(response) => response,
+    }
 }
 
 // ------------------------------------------------------------------ servers

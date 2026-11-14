@@ -88,7 +88,7 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    api::{self, ApiRequest},
+    api::{self, ApiRequest, BlockQuery},
     chain::{self, BlockOutcome, ChainFault, HeaderOutcome, TxOutcome},
     events::{self, EventLog, SeqExhausted},
     mempool::{self, Mempool},
@@ -464,6 +464,32 @@ pub fn handle(state: &mut NodeState, event: Event) -> Result<Flow, NodeFault> {
         }
         Event::Api(ApiRequest::Mempool { reply }) => {
             reply_to(reply, mempool::view(&state.mempool), &mut state.metrics);
+        }
+        Event::Api(ApiRequest::Node { reply }) => {
+            let info = api::node_info(&state.store, state.params.chain_id, state.metrics.peers);
+            reply_to(reply, info, &mut state.metrics);
+        }
+        Event::Api(ApiRequest::CanonicalBlock(query)) => {
+            let BlockQuery { key, json, reply } = *query;
+            let answer = api::canonical_block(&state.store, key, json);
+            reply_to(reply, answer, &mut state.metrics);
+        }
+        Event::Api(ApiRequest::CanonicalHeader { key, reply }) => {
+            let answer = api::canonical_header(&state.store, key);
+            reply_to(reply, answer, &mut state.metrics);
+        }
+        Event::Api(ApiRequest::Blocks {
+            from,
+            to,
+            json,
+            reply,
+        }) => {
+            let answer = api::blocks(&state.store, from, to, json);
+            reply_to(reply, answer, &mut state.metrics);
+        }
+        Event::Api(ApiRequest::Headers { from, to, reply }) => {
+            let answer = api::headers(&state.store, from, to);
+            reply_to(reply, answer, &mut state.metrics);
         }
         Event::Api(ApiRequest::Metrics { reply }) => {
             let text = metrics::render(&state.metrics);

@@ -16,7 +16,7 @@ use tokio::{
 };
 
 use crate::{
-    api::{self, ApiRequest},
+    api::{self, ApiRequest, BlockKey, BlockQuery, BlockReply, Ranged},
     chain::{self, TxOutcome},
     events::{self, EventLog},
     mempool::{self, MempoolLimits},
@@ -1828,4 +1828,138 @@ fn the_miner_runs_candidate_only_when_a_proof_request_is_untried() {
     let before = miner::candidate_calls();
     miner::dispatch(&mut h.state).unwrap();
     assert!(miner::candidate_calls() - before > template_only);
+}
+
+#[test]
+fn the_canonical_chain_is_served_by_key_and_by_range() {
+    let mut h = harness();
+    let genesis = with_genesis(&mut h);
+    let child = block(&genesis, vec![]);
+    deliver(&mut h, &child);
+    let (genesis_id, child_id) = (block_id(&genesis.header), block_id(&child.header));
+    let unknown = pouw_types::BlockId(Hash32([7; 32]));
+
+    let (head, mut head_answer) = oneshot::channel();
+    let (genesis_view, mut genesis_view_answer) = oneshot::channel();
+    let (by_id, mut by_id_answer) = oneshot::channel();
+    let (nobody, mut nobody_answer) = oneshot::channel();
+    let (header, mut header_answer) = oneshot::channel();
+    let (blocks, mut blocks_answer) = oneshot::channel();
+    let (headers, mut headers_answer) = oneshot::channel();
+    let (beyond, mut beyond_answer) = oneshot::channel();
+    let (reversed, mut reversed_answer) = oneshot::channel();
+    let (node, mut node_answer) = oneshot::channel();
+    let query =
+        |key, json, reply| ApiRequest::CanonicalBlock(Box::new(BlockQuery { key, json, reply }));
+    for request in [
+        query(BlockKey::Head, false, head),
+        query(BlockKey::Height(Height(0)), true, genesis_view),
+        query(BlockKey::Id(child_id), false, by_id),
+        query(BlockKey::Id(unknown), false, nobody),
+        ApiRequest::CanonicalHeader {
+            key: BlockKey::Height(Height(1)),
+            reply: header,
+        },
+        ApiRequest::Blocks {
+            from: None,
+            to: None,
+            json: false,
+            reply: blocks,
+        },
+        ApiRequest::Headers {
+            from: Some(1),
+            to: None,
+            reply: headers,
+        },
+        ApiRequest::Headers {
+            from: Some(5),
+            to: None,
+            reply: beyond,
+        },
+        ApiRequest::Headers {
+            from: Some(1),
+            to: Some(0),
+            reply: reversed,
+        },
+        ApiRequest::Node { reply: node },
+    ] {
+        to_api(&h, request);
+    }
+    run(&mut h);
+
+    let child_bytes = borsh::to_vec(&child).unwrap();
+    assert_eq!(
+        head_answer.try_recv().unwrap().unwrap(),
+        Some(BlockReply::Bytes(child_bytes.clone()))
+    );
+    let Some(BlockReply::View(view)) = genesis_view_answer.try_recv().unwrap().unwrap() else {
+        panic!("the genesis is not a view");
+    };
+    assert_eq!(view.id, genesis_id);
+    assert_eq!(
+        by_id_answer.try_recv().unwrap().unwrap(),
+        Some(BlockReply::Bytes(child_bytes.clone()))
+    );
+    assert_eq!(nobody_answer.try_recv().unwrap().unwrap(), None);
+    assert_eq!(
+        header_answer.try_recv().unwrap().unwrap().unwrap().id,
+        child_id
+    );
+    let Ranged::Items(items) = blocks_answer.try_recv().unwrap().unwrap() else {
+        panic!("the blocks are not items");
+    };
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[1], BlockReply::Bytes(child_bytes));
+    let Ranged::Items(found) = headers_answer.try_recv().unwrap().unwrap() else {
+        panic!("the headers are not items");
+    };
+    assert_eq!(found.len(), 1);
+    assert_eq!(
+        beyond_answer.try_recv().unwrap().unwrap(),
+        Ranged::Items(Vec::new())
+    );
+    assert_eq!(
+        reversed_answer.try_recv().unwrap().unwrap(),
+        Ranged::FromAboveTo
+    );
+    let info = node_answer.try_recv().unwrap().unwrap();
+    assert_eq!((info.chain_id, info.height), (CHAIN, Height(1)));
+}
+
+#[test]
+fn a_block_with_a_proof_is_served_with_its_derived_fields() {
+    let mut h = harness();
+    with_circuit(&mut h);
+    h.state.miner = Some(MINER);
+    pool(&mut h, proof_request(1, 0));
+    mine_to(&mut h, 1);
+    h.state.miner = None;
+    let mined = canonical_blocks(&h, 1..=1).remove(0);
+    let parent = canonical_blocks(&h, 0..=0).remove(0);
+
+    let (reply, mut answer) = oneshot::channel();
+    let query = BlockQuery {
+        key: BlockKey::Height(Height(1)),
+        json: true,
+        reply,
+    };
+    to_api(&h, ApiRequest::CanonicalBlock(Box::new(query)));
+    run(&mut h);
+    let Some(BlockReply::View(view)) = answer.try_recv().unwrap().unwrap() else {
+        panic!("the block is not a view");
+    };
+    let etas = eta_chain(
+        &block_id(&parent.header),
+        &mined.compute_txs_root(),
+        &mined.proof_txs,
+    );
+    let [proof] = view.proof_txs.as_slice() else {
+        panic!("the block carries one proof");
+    };
+    assert_eq!(proof.eta, pouw_crypto::hash_to_field(&etas[0]));
+    let mask = mask(&MINER, &circuit_id(), UsageCounter(0));
+    assert_eq!(proof.mask, pouw_crypto::hash_to_field(&mask));
+    assert_eq!(proof.proof_system, h.prover.id());
+    assert_eq!(proof.request_txid, pouw_types::txid(&proof_request(1, 0)));
+    assert_eq!(view.id, block_id(&mined.header));
 }
