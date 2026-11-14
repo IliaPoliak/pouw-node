@@ -15,7 +15,7 @@ use pouw_consensus::{
     StateDiff, StateError, apply_block, better, check_header, median_time_past, next_target,
     timestamp::MTP_WINDOW,
 };
-use pouw_provers::ProverError;
+use pouw_provers::{Prover, ProverError};
 use pouw_types::{
     Account, Block, BlockHeader, BlockId, ChainSpec, Height, Nonce, SystemId, Target, Timestamp,
     TxId, block_id,
@@ -229,12 +229,17 @@ pub fn reject_tx(log: &mut EventLog, invalid: InvalidTx) -> Result<TxOutcome, Se
 /// [`BlockOutcome::ParentFailed`] when it is an ancestor of the received block on a
 /// branch that would have become the chain. `now` is the clock of the node, read once
 /// by the caller, for the timestamp rule.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the parts of the node state the pipeline reads or changes, as the module says"
+)]
 pub fn receive_block(
     store: &mut Store,
     mempool: &mut Mempool,
     log: &mut EventLog,
     metrics: &mut Metrics,
     params: &ConsensusParams,
+    prover: &Prover,
     now: Timestamp,
     checked: &CheckedBlock,
 ) -> Result<BlockOutcome, ChainFault> {
@@ -269,7 +274,16 @@ pub fn receive_block(
     }
     if extends_tip {
         return Ok(
-            match connect_stored(store, mempool, log, params, block, &checked.txids, &id)? {
+            match connect_stored(
+                store,
+                mempool,
+                log,
+                params,
+                prover,
+                block,
+                &checked.txids,
+                &id,
+            )? {
                 Connect::Connected(tip) => {
                     record_block(store, metrics, block)?;
                     BlockOutcome::Connected(tip)
@@ -278,7 +292,7 @@ pub fn receive_block(
             },
         );
     }
-    side_branch(store, mempool, log, params, &id)
+    side_branch(store, mempool, log, params, prover, &id)
 }
 
 /// Counts a block that extended the tip: the block, its proofs and the seconds since its
@@ -522,6 +536,7 @@ fn side_branch(
     mempool: &mut Mempool,
     log: &mut EventLog,
     params: &ConsensusParams,
+    prover: &Prover,
     id: &BlockId,
 ) -> Result<BlockOutcome, ChainFault> {
     let (tip, branch) = {
@@ -543,14 +558,16 @@ fn side_branch(
         warn!(%id, "a side branch with no more work than the tip is stored");
         return Ok(BlockOutcome::SideBranch(*id));
     }
-    Ok(match reorg(store, mempool, log, params, &tip, &branch)? {
-        Reorg::Switched(tip) => BlockOutcome::Reorganized(tip),
-        Reorg::Rejected { block, invalid } if block == *id => BlockOutcome::Invalid(invalid),
-        Reorg::Rejected { block, .. } => {
-            warn!(%id, %block, "block of a branch through a rejected block");
-            BlockOutcome::ParentFailed(*id)
-        }
-    })
+    Ok(
+        match reorg(store, mempool, log, params, prover, &tip, &branch)? {
+            Reorg::Switched(tip) => BlockOutcome::Reorganized(tip),
+            Reorg::Rejected { block, invalid } if block == *id => BlockOutcome::Invalid(invalid),
+            Reorg::Rejected { block, .. } => {
+                warn!(%id, %block, "block of a branch through a rejected block");
+                BlockOutcome::ParentFailed(*id)
+            }
+        },
+    )
 }
 
 /// What became of a switch to a branch.
@@ -580,6 +597,7 @@ pub fn reorg(
     mempool: &mut Mempool,
     log: &mut EventLog,
     params: &ConsensusParams,
+    prover: &Prover,
     tip: &ChainTip,
     branch: &Branch,
 ) -> Result<Reorg, ChainFault> {
@@ -611,6 +629,7 @@ pub fn reorg(
             mempool,
             log,
             params,
+            prover,
             &stored.block,
             &stored.txids,
             id,
@@ -622,7 +641,7 @@ pub fn reorg(
                     store::mark_failed(store, failed)?;
                 }
                 if better(&current, tip) {
-                    return_to(store, mempool, log, params, &current, tip)?;
+                    return_to(store, mempool, log, params, prover, &current, tip)?;
                 }
                 return Ok(Reorg::Rejected {
                     block: *id,
@@ -641,11 +660,12 @@ fn return_to(
     mempool: &mut Mempool,
     log: &mut EventLog,
     params: &ConsensusParams,
+    prover: &Prover,
     from: &ChainTip,
     old: &ChainTip,
 ) -> Result<(), ChainFault> {
     let branch = find_branch(&store::read(store)?, &old.id)?;
-    match reorg(store, mempool, log, params, from, &branch)? {
+    match reorg(store, mempool, log, params, prover, from, &branch)? {
         Reorg::Switched(_) => Ok(()),
         Reorg::Rejected { block, invalid } => Err(StoreError::Corrupt(format!(
             "block {block} was canonical and is now rejected: {invalid}"
@@ -681,16 +701,21 @@ enum Connect {
 /// Applies the stored `block`, whose ids are `txids`, to the tip state with
 /// [`apply_block`] and connects it, drops its transactions from the mempool and records
 /// it. A block the transition rejects is marked failed and recorded as rejected.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the parts of the node state the pipeline reads or changes, as the module says"
+)]
 fn connect_stored(
     store: &mut Store,
     mempool: &mut Mempool,
     log: &mut EventLog,
     params: &ConsensusParams,
+    prover: &Prover,
     block: &Block,
     txids: &[TxId],
     id: &BlockId,
 ) -> Result<Connect, ChainFault> {
-    let transition = transition(&store::read(store)?, params, block, txids, id);
+    let transition = transition(&store::read(store)?, params, prover, block, txids, id);
     let diff = match transition {
         Ok(diff) => diff,
         Err(error) => {
@@ -726,17 +751,19 @@ fn connect_stored(
 fn transition(
     reader: &Reader<'_>,
     params: &ConsensusParams,
+    prover: &Prover,
     block: &Block,
     txids: &[TxId],
     _id: &BlockId,
 ) -> Result<StateDiff, BlockError> {
-    apply_block(params, reader, block, txids)
+    apply_block(params, prover, reader, block, txids)
 }
 
 #[cfg(test)]
 fn transition(
     reader: &Reader<'_>,
     params: &ConsensusParams,
+    prover: &Prover,
     block: &Block,
     txids: &[TxId],
     id: &BlockId,
@@ -744,7 +771,7 @@ fn transition(
     if REJECTED.with(Cell::get) == Some(*id) {
         return Err(InvalidBlock::BadParent.into());
     }
-    apply_block(params, reader, block, txids)
+    apply_block(params, prover, reader, block, txids)
 }
 
 #[cfg(test)]

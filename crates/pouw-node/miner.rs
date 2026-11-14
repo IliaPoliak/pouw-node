@@ -317,23 +317,17 @@ pub fn search_nonce(job: &SearchJob) -> NonceDone {
 /// check never blocks the loop (plan D5, stage 3). It checks the proof of work claim with
 /// [`verify_pow`] and accepts the payload.
 ///
-/// The Groth16 payload verify of the proof txs goes here, with the backend of
-/// pouw-node#93. The rules, per proof tx `i` of `block.proof_txs` in block order:
-/// 1. The request names a circuit and public inputs. The verifying key is
-///    `CircuitEntry::verifying_key` of that circuit in the state of the block's parent.
-///    The worker holds no store, so the job carries the keys of the circuits the block
-///    names, read by the loop when it queues the block. A circuit with no key in the job
-///    is left to `pouw_consensus::apply_block`, which rejects it with `UnknownCircuit`.
-/// 2. `eta` is entry `i` of [`pouw_types::eta_chain`] over `header.parent`,
-///    `Block::compute_txs_root` and `block.proof_txs`. `mask` is [`pouw_types::mask`] of
-///    `header.miner`, the circuit and the proof tx's `usage_counter`.
-/// 3. `Prover::verify` of the key, `Statement::new(&eta, &mask, public_inputs)` and the
-///    proof tx's `proof`. `Ok(true)` passes. `Ok(false)` and the `Malformed*` errors are
-///    `InvalidBlock::InvalidProof { index: i }`. `ProverError::Backend` is a fault of
-///    this node and never a verdict on the block.
-/// 4. The block of an ancestor of `NodeState::assume_valid` is not queued for this stage
-///    in initial block download: `docs/CHAINSPEC.md` (`assume_valid`) and step 6 of
-///    `node::on_headers`.
+/// The proofs of the proof txs are not verified here. `pouw_consensus::apply_block`
+/// verifies them when the block connects (pouw-node#77, rule 9), against the state of the
+/// parent. A work job would need the verifying keys read when the block is queued, and
+/// that state can differ from the parent's: a circuit registered by an earlier block
+/// still in the queue, or only on a side branch, has no key there, so its proof would
+/// be skipped and the block would pass unverified. The price is one `Prover::verify` per
+/// proof tx on the loop thread when the block connects.
+///
+/// The block of an ancestor of `NodeState::assume_valid` is not queued for this stage in
+/// initial block download (`docs/CHAINSPEC.md`, step 6 of `node::on_headers`). Skipping
+/// the proof check of those blocks as well is left to pouw-node#90.
 pub fn verify_work(params: &ConsensusParams, block: CheckedBlock) -> VerifiedWork {
     let verdict = verify_pow(params, &block.block.header, &block.block)
         .map(drop)
@@ -937,6 +931,7 @@ fn seal(state: &mut NodeState, nonce: PowNonce) -> Result<(), NodeFault> {
         &mut state.events,
         &mut state.metrics,
         &state.params,
+        &state.prover,
         (state.clock)(),
         &checked,
     )?;
@@ -1209,7 +1204,14 @@ mod tests {
             proof_txs: Vec::new(),
         };
         let ids: Vec<TxId> = block.txs.iter().map(txid).collect();
-        pouw_consensus::apply_block(&params(), &state, &block, &ids).unwrap();
+        pouw_consensus::apply_block(
+            &params(),
+            &Prover::from(MockProver::default()),
+            &state,
+            &block,
+            &ids,
+        )
+        .unwrap();
     }
 
     #[test]

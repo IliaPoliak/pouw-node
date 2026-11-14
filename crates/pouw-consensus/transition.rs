@@ -1,11 +1,13 @@
 //! Research seam: the state transition of a block. [`apply_block`] is the stateful half
 //! of the validity rules of `contracts/block.md`, the half that needs the account
-//! state. The proof verify is a work job, `pouw-node` `miner::verify_work`.
+//! state. It also verifies the proofs (rule 9), because only here the state of the
+//! block is exact.
 
-use pouw_crypto::Address;
+use pouw_crypto::{Address, Hash32};
+use pouw_provers::{Prover, ProverError, Statement};
 use pouw_types::{
     Amount, Block, CircuitEntry, CircuitId, ConsensusParams, Height, ProofTx, SignedTx, TxId,
-    TxKind, UsageCounter,
+    TxKind, UsageCounter, eta_chain, mask,
 };
 
 use crate::{
@@ -39,7 +41,18 @@ use crate::{
 ///    `BlockOutcome::Invalid`. `BlockError::State` and `BlockError::Prover` are a
 ///    node fault, never held against a peer.
 ///
-/// The proof itself is not checked here, that is the work job `miner::verify_work`.
+/// 5. The proof of each proof tx is verified right after its usage counter
+///    (`InvalidBlock::InvalidProof { index }`, rule 9), with `prover`, the verifying key
+///    of the circuit as `overlay` holds it at that point (a circuit registered earlier in
+///    the block counts), `eta` entry `index` of [`pouw_types::eta_chain`] over
+///    `header.parent`, `Block::compute_txs_root` and `block.proof_txs`, and `mask` of
+///    `header.miner`, the circuit and the counter. `Ok(false)` and a proof, key or input
+///    count the backend cannot decode are `InvalidProof`. Any other backend error is
+///    [`BlockError::Prover`], a fault of this node. This runs here and not in the work
+///    job `miner::verify_work` because the keys must come from the state of the
+///    parent, which only the connect path holds: keys read when a block is queued can be
+///    missing (a circuit registered by an earlier queued block or on a side branch), and
+///    a proof with no key would pass unverified.
 ///
 /// # Errors
 ///
@@ -47,6 +60,7 @@ use crate::{
 /// cannot be read or `txids` do not match the block.
 pub fn apply_block<V: StateView + ?Sized>(
     params: &ConsensusParams,
+    prover: &Prover,
     view: &V,
     block: &Block,
     txids: &[TxId],
@@ -61,12 +75,21 @@ pub fn apply_block<V: StateView + ?Sized>(
         diff: StateDiff::default(),
     };
     let mut fees = Amount(0);
+    let etas = if block.proof_txs.is_empty() {
+        Vec::new()
+    } else {
+        eta_chain(
+            &block.header.parent,
+            &block.compute_txs_root(),
+            &block.proof_txs,
+        )
+    };
 
     for (index, (tx, id)) in block.txs.iter().zip(txids).enumerate() {
         apply_tx(&mut overlay, tx, *id, height, &mut fees)
             .map_err(|fail| fail.in_block(false, index))?;
     }
-    for (index, proof_tx) in block.proof_txs.iter().enumerate() {
+    for (index, (proof_tx, eta)) in block.proof_txs.iter().zip(&etas).enumerate() {
         let circuit = apply_request(&mut overlay, &proof_tx.request, &mut fees)
             .map_err(|fail| fail.in_block(true, index))?;
         let expected = expected_counter(&overlay, &miner, &circuit, index, proof_tx)?;
@@ -78,6 +101,7 @@ pub fn apply_block<V: StateView + ?Sized>(
             }
             .into());
         }
+        check_proof(prover, &overlay, &miner, &circuit, eta, index, proof_tx)?;
         set_usage_counter(&mut overlay, miner, circuit, expected)?;
     }
 
@@ -265,6 +289,41 @@ fn apply_request<V: StateView + ?Sized>(
         .checked_add(request.body.fee)
         .ok_or(InvalidTx::BalanceOverflow)?;
     Ok(*circuit)
+}
+
+/// Rule 9: the proof of `proof_tx` verifies for the circuit as `overlay` holds it, the
+/// `eta` of its place in the block and the mask of the miner and the usage counter.
+fn check_proof<V: StateView + ?Sized>(
+    prover: &Prover,
+    overlay: &ChainState<'_, V>,
+    miner: &Address,
+    circuit: &CircuitId,
+    eta: &Hash32,
+    index: usize,
+    proof_tx: &ProofTx,
+) -> Result<(), BlockError> {
+    let TxKind::ProofRequest { public_inputs, .. } = &proof_tx.request.body.kind else {
+        return Err(
+            StateError::Corrupt("a checked request is not a proof request".to_owned()).into(),
+        );
+    };
+    let Some(entry) = overlay.circuit(circuit)? else {
+        return Err(
+            StateError::Corrupt("the circuit of a checked request is gone".to_owned()).into(),
+        );
+    };
+    let mask_hash = mask(miner, circuit, proof_tx.usage_counter);
+    let statement = Statement::new(eta, &mask_hash, public_inputs);
+    match prover.verify(&entry.verifying_key, &statement, &proof_tx.proof) {
+        Ok(true) => Ok(()),
+        Ok(false)
+        | Err(
+            ProverError::MalformedKey(_)
+            | ProverError::MalformedProof(_)
+            | ProverError::InputCount { .. },
+        ) => Err(InvalidBlock::InvalidProof { index }.into()),
+        Err(error) => Err(BlockError::Prover(error)),
+    }
 }
 
 /// The counter the next proof of `miner` for `circuit` must carry.

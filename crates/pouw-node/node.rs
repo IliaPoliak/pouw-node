@@ -76,7 +76,7 @@ use std::{
 use pouw_api::event::{EventKind, Peer};
 use pouw_consensus::{ConsensusParams, InvalidTx, StateError};
 use pouw_crypto::Address;
-use pouw_provers::ProverError;
+use pouw_provers::{Prover, ProverError};
 use pouw_types::{BlockHeader, BlockId, CumWork, Height, Timestamp};
 use thiserror::Error;
 use tokio::{
@@ -217,6 +217,9 @@ pub struct NodeState {
     pub services: Services,
     /// Receiver of the rewards; the node mines only when set.
     pub miner: Option<Address>,
+    /// The proving backend the loop verifies the proofs of a block with, when the block
+    /// connects (rule 9, pouw-node#77). It is a clone of the one the work worker owns.
+    pub prover: Prover,
     pub store: Store,
     pub mempool: Mempool,
     pub events: EventLog,
@@ -696,7 +699,7 @@ fn on_response(
 ///    [`connect_synced`], the verify queue and `chain::receive_block`. When a window is answered, ask the
 ///    next one.
 /// 6. `state.assume_valid`: for its ancestors the verify-work stage
-///    (`miner::verify_work`, which holds the Groth16 payload verify) may
+///    (`miner::verify_work`, the proof of work check) may
 ///    be skipped, as Bitcoin's `assumevalid` skips script checks. Header, target,
 ///    timestamp and linking rules (step 2) and the other body rules still run for
 ///    every block.
@@ -738,6 +741,7 @@ fn connect_verified(
         &mut state.events,
         &mut state.metrics,
         &state.params,
+        &state.prover,
         (state.clock)(),
         block,
     )?;

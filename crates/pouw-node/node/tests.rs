@@ -88,6 +88,7 @@ fn harness() -> Harness {
         assume_valid: None,
         services: Services::ARCHIVE,
         miner: None,
+        prover: pouw_provers::Prover::from(pouw_provers::MockProver::default()),
         store: store::memory(),
         mempool: mempool::new(MempoolLimits {
             max_bytes: 1 << 20,

@@ -142,6 +142,7 @@ fn start(config: NodeConfig, spec: &ChainSpec, genesis: &Block) -> Result<(), St
         assume_valid: spec.assume_valid,
         services: Services::ARCHIVE,
         miner: config.miner,
+        prover: prover.clone(),
         store,
         mempool: mempool::new(config.mempool),
         events: EventLog {

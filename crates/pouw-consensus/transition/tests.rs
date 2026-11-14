@@ -1,8 +1,9 @@
 use pouw_crypto::{Address, FieldInput, Hash32, SigningKey};
+use pouw_provers::{MockProver, Prover, Statement};
 use pouw_types::{
     Account, Amount, Block, BlockHeader, BlockId, ChainId, CircuitId, ConsensusParams,
     ConstraintCount, Height, Nonce, ProofSystem, ProofTx, SignedTx, Target, TxBody, TxId, TxKind,
-    U32, U64, UsageCounter, sign_body, txid,
+    U32, U64, UsageCounter, eta_chain, mask, sign_body, txid,
 };
 
 use crate::{
@@ -95,6 +96,34 @@ fn proof_tx(request: SignedTx, counter: u64) -> ProofTx {
     }
 }
 
+fn prover() -> Prover {
+    Prover::from(MockProver::default())
+}
+
+/// `block` with a proof the mock backend accepts in every proof tx. The circuits of
+/// `register` have the verifying key `[1]`, which is also the mock proving key. A proof
+/// is bound to the entries before it, so they are filled in order.
+fn proved(mut block: Block) -> Block {
+    let root = block.compute_txs_root();
+    for index in 0..block.proof_txs.len() {
+        let etas = eta_chain(&block.header.parent, &root, &block.proof_txs);
+        let proof_tx = &block.proof_txs[index];
+        let TxKind::ProofRequest {
+            circuit,
+            public_inputs,
+            ..
+        } = &proof_tx.request.body.kind
+        else {
+            continue;
+        };
+        let mask_hash = mask(&block.header.miner, circuit, proof_tx.usage_counter);
+        let statement = Statement::new(etas.get(index).unwrap(), &mask_hash, public_inputs);
+        let proof = prover().prove(&[1], &statement, b"").unwrap();
+        block.proof_txs[index].proof = proof;
+    }
+    block
+}
+
 fn block(txs: Vec<SignedTx>, proof_txs: Vec<ProofTx>) -> Block {
     Block {
         header: BlockHeader {
@@ -130,7 +159,7 @@ fn funded(balance: u64) -> MemState {
 fn run(state: &MemState, block: &Block) -> Result<StateDiff, BlockError> {
     let mut ids = Vec::new();
     block.txids_into(&mut ids);
-    apply_block(&params(), state, block, &ids)
+    apply_block(&params(), &prover(), state, block, &ids)
 }
 
 fn invalid(result: Result<StateDiff, BlockError>) -> InvalidBlock {
@@ -294,10 +323,10 @@ fn a_circuit_registered_in_the_block_can_be_requested_in_the_same_block() {
     let registration = register(1, 0);
     let circuit = CircuitId(txid(&registration));
     let before = funded(100);
-    let candidate = block(
+    let candidate = proved(block(
         vec![registration],
         vec![proof_tx(request(1, 1, circuit), 0)],
-    );
+    ));
     let diff = run(&before, &candidate).unwrap();
     let mut after = before.clone();
     state::apply(&mut after, &diff).unwrap();
@@ -341,7 +370,7 @@ fn the_usage_counter_starts_at_zero_and_goes_up_by_one() {
     state
         .usage_counters
         .insert((MINER, circuit), UsageCounter(4));
-    let next = block(vec![], vec![proof_tx(request(1, 1, circuit), 5)]);
+    let next = proved(block(vec![], vec![proof_tx(request(1, 1, circuit), 5)]));
     let diff = run(&state, &next).unwrap();
     assert_eq!(
         diff.usage_counters[&(MINER, circuit)],
@@ -352,10 +381,66 @@ fn the_usage_counter_starts_at_zero_and_goes_up_by_one() {
     );
 }
 
+/// A request on a circuit registered in the block, with a proof made for the block.
+fn registered_and_proved() -> Block {
+    let registration = register(1, 0);
+    let circuit = CircuitId(txid(&registration));
+    proved(block(
+        vec![registration],
+        vec![proof_tx(request(1, 1, circuit), 0)],
+    ))
+}
+
+#[test]
+fn a_proof_made_for_the_block_verifies() {
+    run(&funded(100), &registered_and_proved()).unwrap();
+}
+
+#[test]
+fn a_proof_that_does_not_verify_is_refused() {
+    let mut candidate = registered_and_proved();
+    candidate.proof_txs[0].proof = Box::from([0xaa; 32]);
+    assert_eq!(
+        invalid(run(&funded(100), &candidate)),
+        InvalidBlock::InvalidProof { index: 0 }
+    );
+}
+
+#[test]
+fn a_proof_that_does_not_decode_is_refused() {
+    let mut candidate = registered_and_proved();
+    candidate.proof_txs[0].proof = Box::from([0xaa; 31]);
+    assert_eq!(
+        invalid(run(&funded(100), &candidate)),
+        InvalidBlock::InvalidProof { index: 0 }
+    );
+}
+
+#[test]
+fn a_proof_is_bound_to_the_parent_of_its_block() {
+    let mut candidate = registered_and_proved();
+    candidate.header.parent = BlockId(Hash32([1; 32]));
+    assert_eq!(
+        invalid(run(&funded(100), &candidate)),
+        InvalidBlock::InvalidProof { index: 0 }
+    );
+}
+
+#[test]
+fn a_proof_is_bound_to_the_miner() {
+    let mut candidate = registered_and_proved();
+    candidate.header.miner = Address([8; 32]);
+    assert_eq!(
+        invalid(run(&funded(100), &candidate)),
+        InvalidBlock::InvalidProof { index: 0 }
+    );
+}
+
 #[test]
 fn txids_that_do_not_match_the_block_are_a_state_fault() {
     let result = apply_block(
         &params(),
+        &prover(),
         &funded(100),
         &block(vec![transfer(1, 0, BOB, 1)], vec![]),
         &[],
