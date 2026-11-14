@@ -12,8 +12,8 @@ use pouw_api::event::{
 };
 use pouw_consensus::{
     AdmissionError, Anchor, BlockError, ChainTip, Change, ConsensusParams, HeaderContext,
-    InvalidBlock, InvalidTx, StateDiff, StateError, apply_block, better, check_admission,
-    check_header, median_time_past, next_target, timestamp::MTP_WINDOW,
+    InvalidBlock, InvalidTx, StateDiff, StateError, StateView, apply_block, better,
+    check_admission, check_header, median_time_past, next_target, timestamp::MTP_WINDOW,
 };
 use pouw_provers::{Prover, ProverError};
 use pouw_types::{
@@ -209,6 +209,17 @@ pub fn receive_tx(
     }
     match mempool::insert(mempool, txid, tx) {
         Ok(id) => {
+            // The pool holds the new transaction, so the later nonces of the sender
+            // must still be covered by the balance after it.
+            let account = StateView::account(&reader, &sender)?.unwrap_or_default();
+            let dropped =
+                mempool::drop_unaffordable(mempool, &sender, account.nonce, account.balance);
+            if !dropped.is_empty() {
+                debug!(
+                    count = dropped.len(),
+                    "dropped transactions the balance no longer covers"
+                );
+            }
             let kind = EventKind::TxReceived(TxReceived {
                 txid: id,
                 tx_kind: tx_kind.to_owned(),

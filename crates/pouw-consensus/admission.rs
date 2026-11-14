@@ -38,14 +38,9 @@ pub fn minimum_fee(params: &ConsensusParams, kind: &TxKind) -> Option<Amount> {
     by_inputs.checked_add(by_witness).map(Amount)
 }
 
-/// What a transaction takes from the balance of its sender: the amount of a transfer
-/// plus the fee. `None` when the sum overflows.
-pub fn cost(body: &TxBody) -> Option<Amount> {
-    match &body.kind {
-        TxKind::Transfer { amount, .. } => amount.checked_add(body.fee),
-        _ => Some(body.fee),
-    }
-}
+/// What a transaction takes from the balance of its sender, the rule of
+/// [`crate::apply_block`].
+pub use crate::transition::cost;
 
 /// Checks `tx` against the state `view` at the tip. `queued` are the bodies of the
 /// pending transactions of the same sender with a lower nonce, which take their cost
