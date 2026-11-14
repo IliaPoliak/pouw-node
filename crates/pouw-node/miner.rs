@@ -64,13 +64,14 @@ use std::{
 };
 
 use pouw_consensus::{
-    ConsensusParams, InvalidBlock, Scratch, StateError, StateView, pow::meets, verify_pow,
+    ConsensusParams, InvalidBlock, Scratch, StateError, StateView, pow::meets, transition::cost,
+    verify_pow,
 };
 use pouw_crypto::{Address, FieldInput, Hash32};
 use pouw_provers::{Prover, ProverError, Statement};
 use pouw_types::{
-    Block, BlockHeader, BlockId, PowNonce, ProofTx, SignedTx, Timestamp, TxId, TxKind, U64,
-    UsageCounter, block_id, eta_chain, mask,
+    Amount, Block, BlockHeader, BlockId, FastMap, PowNonce, ProofTx, SignedTx, Timestamp, TxId,
+    TxKind, U64, UsageCounter, block_id, eta_chain, mask,
     protocol::{
         BLOCK_VERSION, MAX_BLOCK_BYTES, MAX_PROOF_BYTES, MAX_PROOFS_PER_BLOCK, MAX_TXS_PER_BLOCK,
     },
@@ -409,6 +410,11 @@ const PROOF_OVERHEAD_BYTES: usize = 8 + 4 + MAX_PROOF_BYTES;
 ///   later one replacing it when it pays a higher rate and fits. `txs` are applied
 ///   before `proof_txs`, so a request ends the selectable chain of its sender. With
 ///   [`Requests::Skip`] a request is passed over the same way.
+/// - A transaction is taken only when its sender can pay it: the balances start at the
+///   tip and every taken transaction takes its amount and fee from its sender and gives
+///   the amount of a transfer to its receiver, in the order `apply_block` applies them. An
+///   unaffordable transaction is skipped with the rest of its sender's chain, so the
+///   template never holds a transaction `apply_block` would reject.
 /// - Until a request is held, a coin transaction is taken only when the smallest request
 ///   of the pool still fits after it.
 /// - A transaction that does not fit the bytes left or the count left is skipped with
@@ -457,6 +463,10 @@ pub fn candidate<'p, V: StateView + ?Sized>(
         .unwrap_or(0);
     let mut request: Option<(&TxId, &Pending)> = None;
     let mut coin_txs = Vec::new();
+    let mut balances = Balances {
+        state,
+        left: FastMap::default(),
+    };
     while let Some(Ready {
         id: Reverse(id), ..
     }) = ready.pop()
@@ -467,6 +477,9 @@ pub fn candidate<'p, V: StateView + ?Sized>(
         let body = &pending.tx.body;
         if matches!(body.kind, TxKind::ProofRequest { .. }) {
             if !takes(id) {
+                continue;
+            }
+            if !balances.covers(body)? {
                 continue;
             }
             let held = request.map_or(0, |(_, held)| held.bytes);
@@ -491,9 +504,10 @@ pub fn candidate<'p, V: StateView + ?Sized>(
         else {
             continue;
         };
-        if coin_txs.len() >= coin_cap {
+        if coin_txs.len() >= coin_cap || !balances.covers(body)? {
             continue;
         }
+        balances.apply(body)?;
         room = left;
         coin_txs.push(&pending.tx);
         let following = body
@@ -506,6 +520,52 @@ pub fn candidate<'p, V: StateView + ?Sized>(
         request: request.map(|(id, pending)| (id, &pending.tx)),
         coin_txs,
     })
+}
+
+/// What the balances of the accounts are after the transactions selected so far, read
+/// from the state at the tip the first time an account is met.
+struct Balances<'v, V: StateView + ?Sized> {
+    state: &'v V,
+    left: FastMap<Address, Amount>,
+}
+
+impl<V: StateView + ?Sized> Balances<'_, V> {
+    fn get(&mut self, address: &Address) -> Result<Amount, StateError> {
+        if let Some(amount) = self.left.get(address) {
+            return Ok(*amount);
+        }
+        let amount = self.state.account(address)?.unwrap_or_default().balance;
+        self.left.insert(*address, amount);
+        Ok(amount)
+    }
+
+    /// Whether the sender of `body` can pay its amount and fee now.
+    fn covers(&mut self, body: &pouw_types::TxBody) -> Result<bool, StateError> {
+        let Some(needed) = cost(body) else {
+            return Ok(false);
+        };
+        Ok(self.get(&body.sender)? >= needed)
+    }
+
+    /// Takes the cost of `body` from its sender and gives the amount of a transfer to
+    /// its receiver. Only called after [`Self::covers`].
+    fn apply(&mut self, body: &pouw_types::TxBody) -> Result<(), StateError> {
+        let Some(needed) = cost(body) else {
+            return Ok(());
+        };
+        let held = self.get(&body.sender)?;
+        if let Some(rest) = held.checked_sub(needed) {
+            self.left.insert(body.sender, rest);
+        }
+        if let TxKind::Transfer { to, amount } = &body.kind {
+            let had = self.get(to)?;
+            // An overflow keeps the lower balance, which only skips more.
+            if let Some(sum) = had.checked_add(*amount) {
+                self.left.insert(*to, sum);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A selectable transaction in the heap of [`candidate`]: the best rate first, the
@@ -1020,17 +1080,38 @@ mod tests {
         mempool::insert(pool, txid(&tx), tx).unwrap()
     }
 
-    fn state_at(nonces: &[(u8, u64)]) -> MemState {
+    /// Balance of every account the tests use, enough for any fee and amount of them.
+    const RICH: u64 = 1 << 40;
+
+    /// A state where the senders `0..=255` hold `RICH` at nonce 0, except the nonces and
+    /// balances of `accounts` given as `(seed, nonce, balance)`.
+    fn state_of(accounts: &[(u8, u64, u64)]) -> MemState {
         let mut state = MemState::default();
-        for (seed, nonce) in nonces {
+        for seed in 0..=u8::MAX {
+            let address = SigningKey::from_seed([seed; 32]).address();
+            let account = Account {
+                balance: Amount(RICH),
+                nonce: Nonce(0),
+            };
+            state.accounts.insert(address, account);
+        }
+        for (seed, nonce, balance) in accounts {
             let address = SigningKey::from_seed([*seed; 32]).address();
             let account = Account {
-                balance: Amount(0),
+                balance: Amount(*balance),
                 nonce: Nonce(*nonce),
             };
             state.accounts.insert(address, account);
         }
         state
+    }
+
+    fn state_at(nonces: &[(u8, u64)]) -> MemState {
+        let accounts: Vec<(u8, u64, u64)> = nonces
+            .iter()
+            .map(|(seed, nonce)| (*seed, *nonce, RICH))
+            .collect();
+        state_of(&accounts)
     }
 
     fn fees(candidate: &Candidate<'_>) -> Vec<u64> {
@@ -1077,9 +1158,64 @@ mod tests {
     }
 
     #[test]
+    fn a_sender_without_funds_is_not_selected() {
+        let mut pool = pool();
+        add(&mut pool, transfer(1, 0, 5));
+        add(&mut pool, transfer(2, 0, 7));
+        let state = state_of(&[(1, 0, 0)]);
+        let chosen = pick(&pool, &state);
+        assert_eq!(fees(&chosen), [7]);
+    }
+
+    #[test]
+    fn the_cost_of_a_chain_is_summed_over_its_senders_balance() {
+        let mut pool = pool();
+        // Each transfer costs its amount 1 plus its fee 3.
+        for nonce in 0..3 {
+            add(&mut pool, transfer(1, nonce, 3));
+        }
+        let state = state_of(&[(1, 0, 9)]);
+        let chosen = pick(&pool, &state);
+        assert_eq!(chosen.coin_txs.len(), 2);
+        assert_eq!(chosen.coin_txs[1].body.nonce, Nonce(1));
+    }
+
+    #[test]
+    fn a_request_the_sender_cannot_pay_is_passed_over() {
+        let mut pool = pool();
+        add(&mut pool, request(1, 0, 50));
+        add(&mut pool, request(2, 0, 10));
+        let state = state_of(&[(1, 0, 49)]);
+        let chosen = pick(&pool, &state);
+        assert_eq!(fee_of_request(&chosen), Amount(10));
+    }
+
+    #[test]
+    fn a_template_of_the_pool_applies_to_the_state() {
+        // An unfunded sender, a sender with room for two of three transactions and a
+        // funded one: whatever the pool holds, `apply_block` accepts the template.
+        let mut pool = pool();
+        add(&mut pool, transfer(1, 0, 5));
+        for nonce in 0..3 {
+            add(&mut pool, transfer(2, nonce, 3));
+        }
+        add(&mut pool, transfer(3, 0, 1));
+        let state = state_of(&[(1, 0, 0), (2, 0, 9)]);
+        let chosen = pick(&pool, &state);
+        assert_eq!(chosen.coin_txs.len(), 3);
+        let block = Block {
+            header: header(easy_target()),
+            txs: chosen.coin_txs.iter().map(|tx| (*tx).clone()).collect(),
+            proof_txs: Vec::new(),
+        };
+        let ids: Vec<TxId> = block.txs.iter().map(txid).collect();
+        pouw_consensus::apply_block(&params(), &state, &block, &ids).unwrap();
+    }
+
+    #[test]
     fn coin_txs_are_taken_with_no_request_in_the_pool() {
         let mut pool = pool();
-        let state = MemState::default();
+        let state = state_at(&[]);
         let none = pick(&pool, &state);
         assert!(none.request.is_none() && none.coin_txs.is_empty());
         add(&mut pool, transfer(1, 0, 5));
@@ -1093,15 +1229,14 @@ mod tests {
         let mut pool = pool();
         add(&mut pool, request(9, 0, 100));
         add(&mut pool, transfer(1, 0, 5));
-        let chosen =
-            candidate(&pool, &MemState::default(), &PROTOCOL_CAPS, Requests::Skip).unwrap();
+        let chosen = candidate(&pool, &state_at(&[]), &PROTOCOL_CAPS, Requests::Skip).unwrap();
         assert!(chosen.request.is_none());
         assert_eq!(fees(&chosen), [5]);
         let caps = BlockCaps {
             max_bytes: BASE_BYTES + encoded_len(&transfer(1, 0, 5)),
             ..PROTOCOL_CAPS
         };
-        let tight = candidate(&pool, &MemState::default(), &caps, Requests::Skip).unwrap();
+        let tight = candidate(&pool, &state_at(&[]), &caps, Requests::Skip).unwrap();
         assert_eq!(fees(&tight), [5]);
     }
 
@@ -1114,7 +1249,7 @@ mod tests {
         let requests = Requests::Take {
             excluding: &excluding,
         };
-        let chosen = candidate(&pool, &MemState::default(), &PROTOCOL_CAPS, requests).unwrap();
+        let chosen = candidate(&pool, &state_at(&[]), &PROTOCOL_CAPS, requests).unwrap();
         assert_eq!(fee_of_request(&chosen), Amount(10));
     }
 
@@ -1127,7 +1262,7 @@ mod tests {
         for (seed, fee) in [(4, 20), (5, 30), (6, 10)] {
             add(&mut pool, request(seed, 0, fee));
         }
-        let chosen = pick(&pool, &MemState::default());
+        let chosen = pick(&pool, &state_at(&[]));
         assert_eq!(fee_of_request(&chosen), Amount(30));
         let (id, request) = chosen.request.unwrap();
         assert_eq!(*id, txid(request));
@@ -1142,7 +1277,7 @@ mod tests {
         add(&mut pool, transfer(1, 2, 500));
         add(&mut pool, transfer(2, 0, 4));
         add(&mut pool, transfer(2, 1, 3));
-        let chosen = pick(&pool, &MemState::default());
+        let chosen = pick(&pool, &state_at(&[]));
         assert_eq!(fees(&chosen), [5, 4, 3]);
     }
 
@@ -1166,7 +1301,7 @@ mod tests {
         add(&mut pool, transfer(1, 0, 1));
         add(&mut pool, transfer(1, 1, 100));
         add(&mut pool, transfer(2, 0, 50));
-        let chosen = pick(&pool, &MemState::default());
+        let chosen = pick(&pool, &state_at(&[]));
         assert_eq!(fees(&chosen), [50, 1, 100]);
     }
 
@@ -1178,7 +1313,7 @@ mod tests {
         add(&mut pool, transfer(1, 2, 99));
         add(&mut pool, request(2, 0, 10));
         add(&mut pool, transfer(3, 0, 4));
-        let chosen = pick(&pool, &MemState::default());
+        let chosen = pick(&pool, &state_at(&[]));
         assert_eq!(fee_of_request(&chosen), Amount(50));
         assert_eq!(fees(&chosen), [4, 3]);
     }
@@ -1194,7 +1329,7 @@ mod tests {
             max_txs: 4,
             ..PROTOCOL_CAPS
         };
-        let chosen = take(&pool, &MemState::default(), &caps);
+        let chosen = take(&pool, &state_at(&[]), &caps);
         assert_eq!(fees(&chosen), [5, 4, 3]);
     }
 
@@ -1205,7 +1340,7 @@ mod tests {
         for seed in 1..=4 {
             add(&mut pool, transfer(seed, 0, u64::from(seed)));
         }
-        let state = MemState::default();
+        let state = state_at(&[]);
         let everything = pick(&pool, &state);
         let full = encoded_len(&block_of(&everything));
         assert_eq!(everything.coin_txs.len(), 4);
@@ -1233,7 +1368,7 @@ mod tests {
             max_bytes: BASE_BYTES + PROOF_OVERHEAD_BYTES - 1,
             ..PROTOCOL_CAPS
         };
-        let chosen = take(&pool, &MemState::default(), &caps);
+        let chosen = take(&pool, &state_at(&[]), &caps);
         assert!(chosen.request.is_none() && chosen.coin_txs.is_empty());
     }
 

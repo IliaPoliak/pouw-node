@@ -95,6 +95,17 @@ pub fn apply_block<V: StateView + ?Sized>(
     Ok(overlay.diff)
 }
 
+/// What a transaction takes from the balance of its sender: the amount of a transfer
+/// plus the fee, the fee alone for the other kinds. `None` when the sum overflows.
+/// [`apply_block`] takes exactly this from the sender, so the mempool and the miner
+/// use it to tell what a block can apply.
+pub fn cost(body: &pouw_types::TxBody) -> Option<Amount> {
+    match &body.kind {
+        TxKind::Transfer { amount, .. } => amount.checked_add(body.fee),
+        _ => Some(body.fee),
+    }
+}
+
 /// Why one transaction could not be applied.
 enum Fail {
     /// The transaction breaks a rule.
