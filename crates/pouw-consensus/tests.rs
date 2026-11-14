@@ -407,3 +407,44 @@ fn reason_codes_of_the_contract() {
         "expected nonce 4, got 3"
     );
 }
+
+fn circuit_tx(nonce: u64, bytes: usize) -> SignedTx {
+    signed(
+        nonce,
+        TxKind::RegisterCircuit {
+            system: ProofSystem::Groth16,
+            constraint_count: ConstraintCount(1),
+            verifying_key: Box::from([1]),
+            circuit: vec![0; bytes].into_boxed_slice(),
+        },
+    )
+}
+
+#[test]
+fn a_block_over_the_byte_limit_is_rejected() {
+    let txs = vec![
+        circuit_tx(0, MAX_CIRCUIT_BYTES - 1),
+        circuit_tx(1, MAX_CIRCUIT_BYTES - 1),
+    ];
+    let error = body(&child(txs, vec![]), CHAIN).unwrap_err();
+    assert!(matches!(
+        error,
+        InvalidBlock::OverLimit { what: "bytes", .. }
+    ));
+    assert_eq!(error.reason_code(), "over_limit");
+}
+
+#[test]
+fn a_transaction_over_its_limit_is_rejected_in_a_block() {
+    let block = child(vec![circuit_tx(0, MAX_CIRCUIT_BYTES + 1)], vec![]);
+    let error = body(&block, CHAIN).unwrap_err();
+    assert!(matches!(
+        error,
+        InvalidBlock::Tx {
+            proof: false,
+            index: 0,
+            source: InvalidTx::OverLimit { .. },
+        }
+    ));
+    assert_eq!(error.reason_code(), "over_limit");
+}

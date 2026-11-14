@@ -447,3 +447,69 @@ fn txids_that_do_not_match_the_block_are_a_state_fault() {
     );
     assert!(matches!(result, Err(BlockError::State(_))));
 }
+
+#[test]
+fn a_receiver_balance_that_would_overflow_is_refused() {
+    let mut state = funded(100);
+    state.accounts.insert(
+        BOB,
+        Account {
+            balance: Amount(u64::MAX),
+            nonce: Nonce(0),
+        },
+    );
+    let result = run(&state, &block(vec![transfer(1, 0, BOB, 1)], vec![]));
+    assert_eq!(
+        invalid(result),
+        InvalidBlock::Tx {
+            proof: false,
+            index: 0,
+            source: InvalidTx::BalanceOverflow,
+        }
+    );
+}
+
+#[test]
+fn a_nonce_that_cannot_go_up_is_refused() {
+    let mut state = funded(100);
+    state.accounts.insert(
+        alice(),
+        Account {
+            balance: Amount(100),
+            nonce: Nonce(u64::MAX),
+        },
+    );
+    let result = run(&state, &block(vec![transfer(1, u64::MAX, BOB, 1)], vec![]));
+    assert_eq!(
+        invalid(result),
+        InvalidBlock::Tx {
+            proof: false,
+            index: 0,
+            source: InvalidTx::BadNonce {
+                expected: Nonce(u64::MAX),
+                found: Nonce(u64::MAX),
+            },
+        }
+    );
+}
+
+#[test]
+fn a_usage_counter_that_cannot_go_up_is_refused() {
+    let registration = register(1, 0);
+    let circuit = CircuitId(txid(&registration));
+    let mut state = funded(100);
+    let diff = run(&state, &block(vec![registration], vec![])).unwrap();
+    state::apply(&mut state, &diff).unwrap();
+    state
+        .usage_counters
+        .insert((MINER, circuit), UsageCounter(u64::MAX));
+    let next = block(vec![], vec![proof_tx(request(1, 1, circuit), 0)]);
+    assert_eq!(
+        invalid(run(&state, &next)),
+        InvalidBlock::BadUsageCounter {
+            index: 0,
+            expected: UsageCounter(u64::MAX),
+            found: UsageCounter(0),
+        }
+    );
+}
