@@ -33,7 +33,7 @@ pub mod schema;
 #[cfg(not(any(feature = "store-mem", feature = "rocksdb")))]
 compile_error!("enable the `store-mem` or the `rocksdb` feature to have a store backend");
 
-use std::path::{Path, PathBuf};
+use std::{borrow::Cow, path::Path};
 
 use pouw_consensus::{ChainTip, DiffMismatch, StateDiff, StateError, StateView};
 use pouw_crypto::Address;
@@ -135,12 +135,9 @@ pub enum StoreError {
         kind: StoreKind,
         feature: &'static str,
     },
-    /// The backend has no implementation yet.
-    #[error("the {backend} backend is not implemented, cannot open {}", path.display())]
-    NotImplemented {
-        backend: &'static str,
-        path: PathBuf,
-    },
+    /// The database of the `RocksDB` backend failed.
+    #[error("the RocksDB database failed: {0}")]
+    Backend(String),
 }
 
 /// Where a canonical block holds a transaction. For a proof request this is its proof
@@ -174,12 +171,13 @@ pub enum Reader<'a> {
     Rocks(&'a rocks::Db),
 }
 
-/// A stored block as encoded bytes, with its header read in place.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A stored block as encoded bytes, with its header read from them. The bytes are
+/// borrowed from the memory backend and owned when a database returned them.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockBytes<'a> {
-    pub header: &'a BlockHeader,
+    pub header: BlockHeader,
     /// The whole block in its borsh encoding, which starts with the header bytes.
-    pub bytes: &'a [u8],
+    pub bytes: Cow<'a, [u8]>,
 }
 
 /// Opens or creates the store of `kind` under `path` and checks its schema version. The
@@ -309,7 +307,7 @@ pub fn tx_location(reader: &Reader<'_>, id: &TxId) -> Result<Option<TxLocation>,
 
 /// The owned block of `stored`.
 pub fn decode(stored: &BlockBytes<'_>) -> Result<Block, StoreError> {
-    borsh::from_slice(stored.bytes).map_err(StoreError::Decode)
+    borsh::from_slice(&stored.bytes).map_err(StoreError::Decode)
 }
 
 /// Indexes the header `header` of block `id`, whose parent must be indexed already.
@@ -475,7 +473,7 @@ pub fn connect_block(
         #[cfg(feature = "store-mem")]
         Store::Mem(mem) => mem::connect(mem, &new_tip, entry, locations, diff)?,
         #[cfg(feature = "rocksdb")]
-        Store::Rocks(db) => rocks::connect(db, &new_tip, entry, locations, diff)?,
+        Store::Rocks(db) => rocks::connect(db, &new_tip, entry, &locations, diff)?,
     }
     Ok(new_tip)
 }
@@ -546,18 +544,21 @@ fn parent_of_tip(reader: &Reader<'_>) -> Result<Option<ChainTip>, StoreError> {
     }
 }
 
-fn stored_block<'r>(reader: &'r Reader<'_>, id: &BlockId) -> Result<Option<&'r [u8]>, StoreError> {
+fn stored_block<'r>(
+    reader: &'r Reader<'_>,
+    id: &BlockId,
+) -> Result<Option<Cow<'r, [u8]>>, StoreError> {
     match reader {
         #[cfg(feature = "store-mem")]
-        Reader::Mem(view) => Ok(mem::stored_block(view, id)),
+        Reader::Mem(view) => Ok(mem::stored_block(view, id).map(Cow::Borrowed)),
         #[cfg(feature = "rocksdb")]
         Reader::Rocks(view) => rocks::stored_block(view, id),
     }
 }
 
-fn parse_block(bytes: &[u8]) -> Result<BlockBytes<'_>, StoreError> {
-    let prefix = bytes.get(..BlockHeader::SIZE).unwrap_or(bytes);
-    let header = BlockHeader::ref_from_versioned(prefix)?;
+fn parse_block(bytes: Cow<'_, [u8]>) -> Result<BlockBytes<'_>, StoreError> {
+    let prefix = bytes.get(..BlockHeader::SIZE).unwrap_or(&bytes[..]);
+    let header = *BlockHeader::ref_from_versioned(prefix)?;
     Ok(BlockBytes { header, bytes })
 }
 

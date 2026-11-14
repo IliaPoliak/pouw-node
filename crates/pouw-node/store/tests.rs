@@ -1,501 +1,248 @@
-use pouw_consensus::{ChainState, StateDiff, StateView, state};
-use pouw_crypto::{Address, Hash32, SigningKey};
-use pouw_types::{
-    Amount, Block, BlockHeader, BlockId, ChainId, CumWork, Height, Nonce, SignedTx, Target, TxBody,
-    TxId, TxKind, U32, U64, U256, block_id, sign_body, txid,
-};
+//! The contract tests of the store. `contract.rs` holds them once and they run on every
+//! backend that is built in: the module of a backend defines `new_store` and the two
+//! helpers that reach into its tables, then includes the file. What only one backend
+//! can show, such as a restart, is in its module.
 
-use zerocopy::IntoBytes;
+#[cfg(feature = "store-mem")]
+mod on_memory {
+    include!("contract.rs");
 
-use crate::{
-    config::StoreKind,
-    store::{
-        self, Store, StoreError,
-        schema::{IndexEntry, SCHEMA_VERSION, Status},
-    },
-};
-
-const MINER: Address = Address([9; 32]);
-
-fn transfer(nonce: u64) -> SignedTx {
-    let key = SigningKey::from_seed([1; 32]);
-    sign_body(
-        &TxBody {
-            chain_id: ChainId(1),
-            sender: key.address(),
-            nonce: Nonce(nonce),
-            fee: Amount(1),
-            kind: TxKind::Transfer {
-                to: Address([2; 32]),
-                amount: Amount(3),
-            },
-        },
-        &key,
-    )
-}
-
-/// Target 2^255 - 1, the block work of which is 2.
-const WORK_TWO: Target = Target([
-    0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-]);
-
-fn block(height: u64, parent: BlockId, miner: Address, txs: Vec<SignedTx>) -> Block {
-    let mut block = Block {
-        header: BlockHeader {
-            version: U32::new(1),
-            chain_id: U32::new(1),
-            system_id: U64::new(0),
-            height: U64::new(height),
-            parent,
-            timestamp: U64::new(height),
-            miner,
-            tx_root: Hash32::ZERO,
-            target: WORK_TWO,
-            nonce: U64::new(0),
-        },
-        txs,
-        proof_txs: vec![],
-    };
-    block.header.tx_root = block.compute_tx_root();
-    block
-}
-
-fn ids(block: &Block) -> Vec<TxId> {
-    let mut txids = Vec::new();
-    block.txids_into(&mut txids);
-    txids
-}
-
-fn put(store: &mut Store, block: &Block) -> BlockId {
-    let id = block_id(&block.header);
-    store::put_header(store, &id, &block.header).unwrap();
-    store::put_body(store, &id, &borsh::to_vec(block).unwrap()).unwrap();
-    id
-}
-
-fn entry(store: &Store, id: &BlockId) -> IndexEntry {
-    store::index(&store::read(store).unwrap(), id)
-        .unwrap()
-        .unwrap()
-}
-
-fn connect(
-    store: &mut Store,
-    block: &Block,
-    diff: &StateDiff,
-) -> Result<pouw_consensus::ChainTip, StoreError> {
-    store::connect_block(store, &block_id(&block.header), &ids(block), diff)
-}
-
-fn disconnect(store: &mut Store, block: &Block) -> Result<pouw_consensus::ChainTip, StoreError> {
-    store::disconnect_tip(store, &ids(block))
-}
-
-fn credit(store: &Store, address: Address, amount: u64) -> StateDiff {
-    let reader = store::read(store).unwrap();
-    let mut overlay = ChainState {
-        base: &reader,
-        diff: StateDiff::default(),
-    };
-    let mut account = overlay.account(&address).unwrap().unwrap_or_default();
-    account.balance = Amount(account.balance.0.checked_add(amount).unwrap());
-    state::set_account(&mut overlay, address, account).unwrap();
-    overlay.diff
-}
-
-fn balance(store: &Store, address: &Address) -> Option<Amount> {
-    let reader = store::read(store).unwrap();
-    reader.account(address).unwrap().map(|a| a.balance)
-}
-
-fn connect_genesis(store: &mut Store) -> BlockId {
-    let genesis = block(0, BlockId::ZERO, MINER, vec![]);
-    let id = put(store, &genesis);
-    let diff = credit(store, MINER, 100);
-    connect(store, &genesis, &diff).unwrap();
-    id
-}
-
-#[test]
-fn three_blocks_connected_and_disconnected_restore_the_state() {
-    let mut store = store::memory();
-    let genesis_id = connect_genesis(&mut store);
-    let genesis_tip = store::tip(&store::read(&store).unwrap()).unwrap();
-    let genesis_balance = balance(&store, &MINER);
-
-    let mut prev = genesis_id;
-    let mut blocks = Vec::new();
-    for height in 1..=3 {
-        let next = block(height, prev, MINER, vec![transfer(height)]);
-        put(&mut store, &next);
-        let diff = credit(&store, MINER, 10);
-        let tip = connect(&mut store, &next, &diff).unwrap();
-        blocks.push(next);
-        assert_eq!(tip.height, Height(height));
-        assert_eq!(tip.cumulative_work, CumWork(U256::from(2 * (height + 1))));
-        prev = tip.id;
+    fn new_store() -> crate::store::Store {
+        crate::store::memory()
     }
-    let included = transfer(2);
-    {
-        let reader = store::read(&store).unwrap();
-        assert_eq!(
-            store::tx_location(&reader, &txid(&included))
-                .unwrap()
-                .unwrap()
-                .height,
-            Height(2)
-        );
+
+    fn set_index_raw(
+        store: &mut crate::store::Store,
+        id: pouw_types::BlockId,
+        entry: crate::store::schema::IndexEntry,
+    ) {
+        match store {
+            crate::store::Store::Mem(mem) => crate::store::mem::set_index(mem, id, entry),
+            #[cfg(feature = "rocksdb")]
+            crate::store::Store::Rocks(_) => unreachable!("this is the memory store"),
+        }
     }
-    assert_eq!(balance(&store, &MINER), Some(Amount(130)));
 
-    for stored in blocks.iter().rev() {
-        disconnect(&mut store, stored).unwrap();
+    fn set_schema_version(store: &mut crate::store::Store, version: u32) {
+        match store {
+            crate::store::Store::Mem(mem) => mem.meta.schema_version = version,
+            #[cfg(feature = "rocksdb")]
+            crate::store::Store::Rocks(_) => unreachable!("this is the memory store"),
+        }
     }
-    let reader = store::read(&store).unwrap();
-    assert_eq!(store::tip(&reader).unwrap(), genesis_tip);
-    assert_eq!(balance_of(&reader), genesis_balance);
-    assert_eq!(store::tx_location(&reader, &txid(&included)).unwrap(), None);
-    assert_eq!(store::canonical_id(&reader, Height(1)).unwrap(), None);
-    assert!(store::block(&reader, &prev).unwrap().is_some());
-    assert_canonical_contiguous(&store);
-    assert!(matches!(
-        store::disconnect_tip(&mut store, &[]),
-        Err(StoreError::GenesisDisconnect)
-    ));
-}
 
-/// Heights 0 to the tip each have a connected block, and none lies above.
-fn assert_canonical_contiguous(store: &Store) {
-    let reader = store::read(store).unwrap();
-    let tip = store::tip(&reader).unwrap().unwrap();
-    let mut parent = BlockId::ZERO;
-    for height in 0..=tip.height.0 {
-        let id = store::canonical_id(&reader, Height(height))
-            .unwrap()
-            .expect("a canonical block at every height up to the tip");
-        let stored = store::index(&reader, &id).unwrap().unwrap();
-        assert_eq!(stored.height, U64::new(height));
-        assert!(stored.status.contains(Status::CONNECTED));
-        assert_eq!(store::header(&reader, &id).unwrap().unwrap().parent, parent);
-        parent = id;
+    #[test]
+    fn the_memory_kind_opens_an_empty_store() {
+        let store = store::open(
+            crate::config::StoreKind::Memory,
+            std::path::Path::new("unused"),
+        )
+        .unwrap();
+        assert_eq!(store::tip(&store::read(&store).unwrap()).unwrap(), None);
     }
-    assert_eq!(parent, tip.id);
-    assert_eq!(
-        store::canonical_id(&reader, Height(tip.height.0.saturating_add(1))).unwrap(),
-        None
-    );
-}
-
-fn balance_of(reader: &store::Reader<'_>) -> Option<Amount> {
-    reader.account(&MINER).unwrap().map(|a| a.balance)
-}
-
-#[test]
-fn only_a_child_of_the_tip_connects() {
-    let mut store = store::memory();
-    let genesis_id = connect_genesis(&mut store);
-    let first = block(1, genesis_id, MINER, vec![]);
-    let first_id = put(&mut store, &first);
-    let second = block(2, first_id, MINER, vec![]);
-    put(&mut store, &second);
-    assert!(matches!(
-        connect(&mut store, &second, &StateDiff::default()),
-        Err(StoreError::NotChildOfTip { .. })
-    ));
-    assert!(matches!(
-        store::connect_block(&mut store, &BlockId::ZERO, &[], &StateDiff::default()),
-        Err(StoreError::UnknownBlock(_))
-    ));
-}
-
-#[test]
-fn the_first_block_must_be_a_genesis_block() {
-    let mut store = store::memory();
-    let genesis = block(0, BlockId::ZERO, MINER, vec![]);
-    put(&mut store, &genesis);
-    let other = block(0, BlockId::ZERO, Address([4; 32]), vec![]);
-    put(&mut store, &other);
-    assert!(matches!(
-        store::disconnect_tip(&mut store, &[]),
-        Err(StoreError::EmptyChain)
-    ));
-    connect(&mut store, &genesis, &StateDiff::default()).unwrap();
-    assert!(matches!(
-        connect(&mut store, &other, &StateDiff::default()),
-        Err(StoreError::NotChildOfTip { .. })
-    ));
-}
-
-#[test]
-fn a_header_with_an_unknown_parent_is_refused() {
-    let mut store = store::memory();
-    let parent = BlockId(Hash32([5; 32]));
-    let orphan = block(1, parent, MINER, vec![]);
-    let id = block_id(&orphan.header);
-    assert!(matches!(
-        store::put_header(&mut store, &id, &orphan.header),
-        Err(StoreError::Orphan { parent: found, .. }) if found == parent
-    ));
-    let reader = store::read(&store).unwrap();
-    assert_eq!(store::index(&reader, &id).unwrap(), None);
-    assert_eq!(store::header(&reader, &id).unwrap(), None);
-}
-
-#[test]
-fn a_header_must_be_one_above_its_parent() {
-    let mut store = store::memory();
-    let genesis_id = connect_genesis(&mut store);
-    let skipping = block(2, genesis_id, MINER, vec![]);
-    let id = block_id(&skipping.header);
-    assert!(matches!(
-        store::put_header(&mut store, &id, &skipping.header),
-        Err(StoreError::HeightMismatch { .. })
-    ));
-}
-
-#[test]
-fn cumulative_work_accumulates_over_the_parent() {
-    let mut store = store::memory();
-    let mut prev = BlockId::ZERO;
-    for height in 0..4 {
-        let next = block(height, prev, MINER, vec![]);
-        prev = put(&mut store, &next);
-        let stored = entry(&store, &prev);
-        assert_eq!(stored.height, U64::new(height));
-        assert_eq!(stored.work(), CumWork(U256::from(2 * (height + 1))));
-        assert!(stored.status.contains(Status::HEADER_VALID));
-    }
-}
-
-#[test]
-fn a_body_needs_its_header_first() {
-    let mut store = store::memory();
-    let genesis = block(0, BlockId::ZERO, MINER, vec![]);
-    let id = block_id(&genesis.header);
-    let bytes = borsh::to_vec(&genesis).unwrap();
-    assert!(matches!(
-        store::put_body(&mut store, &id, &bytes),
-        Err(StoreError::NoHeader(found)) if found == id
-    ));
-    store::put_header(&mut store, &id, &genesis.header).unwrap();
-    let reader = store::read(&store).unwrap();
-    assert!(store::header(&reader, &id).unwrap().is_some());
-    assert_eq!(store::block(&reader, &id).unwrap(), None);
-    assert!(!entry(&store, &id).status.contains(Status::BODY_STORED));
-    let other = block(0, BlockId::ZERO, Address([4; 32]), vec![]);
-    assert!(matches!(
-        store::put_body(&mut store, &id, &borsh::to_vec(&other).unwrap()),
-        Err(StoreError::BodyHeaderMismatch(found)) if found == id
-    ));
-    store::put_body(&mut store, &id, &bytes).unwrap();
-    assert!(entry(&store, &id).status.contains(Status::BODY_STORED));
-}
-
-#[test]
-fn a_header_without_a_body_does_not_connect() {
-    let mut store = store::memory();
-    let genesis = block(0, BlockId::ZERO, MINER, vec![]);
-    let id = block_id(&genesis.header);
-    store::put_header(&mut store, &id, &genesis.header).unwrap();
-    assert!(matches!(
-        connect(&mut store, &genesis, &StateDiff::default()),
-        Err(StoreError::NoBody(found)) if found == id
-    ));
-}
-
-#[test]
-fn status_follows_connect_and_disconnect() {
-    let mut store = store::memory();
-    let genesis_id = connect_genesis(&mut store);
-    let first = block(1, genesis_id, MINER, vec![]);
-    let id = put(&mut store, &first);
-    store::mark_work_valid(&mut store, &id).unwrap();
-    let before = entry(&store, &id).status;
-    assert!(before.contains(Status::WORK_VALID));
-    assert!(!before.contains(Status::CONNECTED));
-    connect(&mut store, &first, &StateDiff::default()).unwrap();
-    assert!(entry(&store, &id).status.contains(Status::CONNECTED));
-    disconnect(&mut store, &first).unwrap();
-    assert_eq!(entry(&store, &id).status, before);
-}
-
-#[test]
-fn failed_status_reaches_a_child_and_blocks_connecting() {
-    let mut store = store::memory();
-    let genesis_id = connect_genesis(&mut store);
-    let first = block(1, genesis_id, MINER, vec![]);
-    let first_id = put(&mut store, &first);
-    store::mark_failed(&mut store, &first_id).unwrap();
-    assert!(entry(&store, &first_id).status.contains(Status::FAILED));
-    let child = block(2, first_id, MINER, vec![]);
-    let child_id = put(&mut store, &child);
-    assert!(entry(&store, &child_id).status.contains(Status::FAILED));
-    let grandchild = block(3, child_id, MINER, vec![]);
-    let grandchild_id = put(&mut store, &grandchild);
-    assert!(
-        entry(&store, &grandchild_id)
-            .status
-            .contains(Status::FAILED)
-    );
-    assert!(matches!(
-        connect(&mut store, &first, &StateDiff::default()),
-        Err(StoreError::Failed(found)) if found == first_id
-    ));
-    assert!(matches!(
-        connect(&mut store, &child, &StateDiff::default()),
-        Err(StoreError::Failed(found)) if found == child_id
-    ));
-}
-
-#[test]
-fn the_index_entry_has_a_fixed_layout() {
-    let entry = IndexEntry::new(
-        Height(0x0102),
-        CumWork(U256::from(0x0304u64)),
-        Status::HEADER_VALID.with(Status::CONNECTED),
-    );
-    let mut expected = [0u8; 41];
-    expected[0] = 0x02;
-    expected[1] = 0x01;
-    expected[38] = 0x03;
-    expected[39] = 0x04;
-    expected[40] = 0b0000_1001;
-    assert_eq!(entry.as_bytes(), expected);
-}
-
-#[test]
-fn a_store_of_another_schema_version_is_refused() {
-    let mut store = store::memory();
-    store::check_schema(&store).unwrap();
-    let Store::Mem(mem) = &mut store else {
-        panic!("memory store");
-    };
-    mem.meta.schema_version = SCHEMA_VERSION.wrapping_add(1);
-    let error = store::check_schema(&store).unwrap_err();
-    assert!(matches!(
-        error,
-        StoreError::SchemaMismatch { found, expected }
-            if found == SCHEMA_VERSION.wrapping_add(1) && expected == SCHEMA_VERSION
-    ));
-    assert!(error.to_string().contains("schema version"));
-}
-
-#[test]
-fn a_stale_diff_leaves_the_store_unchanged() {
-    let mut store = store::memory();
-    let stale = credit(&store, MINER, 100);
-    let genesis_id = connect_genesis(&mut store);
-    let next = block(1, genesis_id, MINER, vec![transfer(1)]);
-    put(&mut store, &next);
-    assert!(matches!(
-        connect(&mut store, &next, &stale),
-        Err(StoreError::Diff(_))
-    ));
-    let reader = store::read(&store).unwrap();
-    assert_eq!(store::tip(&reader).unwrap().unwrap().id, genesis_id);
-    assert_eq!(
-        store::tx_location(&reader, &txid(&transfer(1))).unwrap(),
-        None
-    );
-    assert_eq!(store::canonical_id(&reader, Height(1)).unwrap(), None);
-    assert_eq!(balance(&store, &MINER), Some(Amount(100)));
-}
-
-#[test]
-fn a_reorg_switches_the_canonical_branch() {
-    let mut store = store::memory();
-    let genesis_id = connect_genesis(&mut store);
-    let other_miner = Address([8; 32]);
-    let main = block(1, genesis_id, MINER, vec![transfer(1)]);
-    let side = block(1, genesis_id, other_miner, vec![transfer(2)]);
-    let main_id = put(&mut store, &main);
-    let side_id = put(&mut store, &side);
-    let diff = credit(&store, MINER, 10);
-    connect(&mut store, &main, &diff).unwrap();
-
-    disconnect(&mut store, &main).unwrap();
-    let diff = credit(&store, other_miner, 10);
-    let tip = connect(&mut store, &side, &diff).unwrap();
-
-    assert_eq!(tip.id, side_id);
-    let reader = store::read(&store).unwrap();
-    assert_eq!(
-        store::canonical_id(&reader, Height(1)).unwrap(),
-        Some(side_id)
-    );
-    assert_eq!(
-        store::tx_location(&reader, &txid(&transfer(1))).unwrap(),
-        None
-    );
-    assert_eq!(
-        store::tx_location(&reader, &txid(&transfer(2)))
-            .unwrap()
-            .map(|l| l.block),
-        Some(side_id)
-    );
-    assert!(store::block(&reader, &main_id).unwrap().is_some());
-    assert_eq!(balance(&store, &MINER), Some(Amount(100)));
-    assert_eq!(balance(&store, &other_miner), Some(Amount(10)));
-    assert!(!entry(&store, &main_id).status.contains(Status::CONNECTED));
-    assert!(entry(&store, &side_id).status.contains(Status::CONNECTED));
-    assert_canonical_contiguous(&store);
-}
-
-#[test]
-fn borrowed_reads_equal_the_written_block() {
-    let mut store = store::memory();
-    let written = block(0, BlockId::ZERO, MINER, vec![transfer(1), transfer(2)]);
-    let id = put(&mut store, &written);
-    assert_eq!(
-        put(&mut store, &written),
-        id,
-        "storing twice is not an error"
-    );
-
-    let reader = store::read(&store).unwrap();
-    assert_eq!(store::header(&reader, &id).unwrap(), Some(&written.header));
-    let stored = store::block(&reader, &id).unwrap().unwrap();
-    assert_eq!(stored.header, &written.header);
-    assert_eq!(store::decode(&stored).unwrap(), written);
-    assert_eq!(stored.bytes, borsh::to_vec(&written).unwrap().as_slice());
-    assert_eq!(store::block(&reader, &BlockId::ZERO).unwrap(), None);
-    assert_eq!(store::header(&reader, &BlockId::ZERO).unwrap(), None);
-}
-
-#[test]
-fn the_memory_kind_opens_an_empty_store() {
-    let store = store::open(StoreKind::Memory, std::path::Path::new("unused")).unwrap();
-    assert_eq!(store::tip(&store::read(&store).unwrap()).unwrap(), None);
 }
 
 #[cfg(feature = "rocksdb")]
-#[test]
-fn the_rocksdb_kind_reports_that_it_is_not_implemented() {
-    let result = store::open(StoreKind::Rocksdb, std::path::Path::new("data"));
-    assert!(matches!(
-        result,
-        Err(StoreError::NotImplemented {
-            backend: "RocksDB",
-            ..
-        })
-    ));
-}
+mod on_rocksdb {
+    include!("contract.rs");
 
-#[test]
-#[allow(unreachable_patterns, clippy::match_wildcard_for_single_variants)]
-fn a_header_over_a_parent_at_the_last_height_is_refused() {
-    let mut store = store::memory();
-    let genesis_id = connect_genesis(&mut store);
-    let last = IndexEntry::new(Height(u64::MAX), CumWork::ZERO, Status::HEADER_VALID);
-    match &mut store {
-        Store::Mem(mem) => store::mem::set_index(mem, genesis_id, last),
-        _ => unreachable!("the memory store is a Mem"),
+    use crate::config::StoreKind;
+
+    /// A directory that does not exist yet, unique to this test run.
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("pouw-store-{}-{name}-{n}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        dir
     }
-    let child = block(u64::MAX, genesis_id, MINER, vec![]);
-    let id = block_id(&child.header);
-    assert!(matches!(
-        store::put_header(&mut store, &id, &child.header),
-        Err(StoreError::HeightOverflow(parent)) if parent == genesis_id
-    ));
+
+    fn new_store() -> Store {
+        store::open(StoreKind::Rocksdb, &temp_dir("contract")).unwrap()
+    }
+
+    fn set_index_raw(store: &mut Store, id: BlockId, entry: IndexEntry) {
+        match store {
+            Store::Rocks(db) => crate::store::rocks::set_index(db, id, entry).unwrap(),
+            #[cfg(feature = "store-mem")]
+            Store::Mem(_) => unreachable!("this is the RocksDB store"),
+        }
+    }
+
+    fn set_schema_version(store: &mut Store, version: u32) {
+        match store {
+            Store::Rocks(db) => crate::store::rocks::set_schema_version(db, version).unwrap(),
+            #[cfg(feature = "store-mem")]
+            Store::Mem(_) => unreachable!("this is the RocksDB store"),
+        }
+    }
+
+    fn open(dir: &std::path::Path) -> Store {
+        store::open(StoreKind::Rocksdb, dir).unwrap()
+    }
+
+    #[test]
+    fn the_rocksdb_kind_creates_the_directory_and_opens_an_empty_store() {
+        let dir = temp_dir("fresh").join("nested").join("db");
+        let store = open(&dir);
+        assert_eq!(store::tip(&store::read(&store).unwrap()).unwrap(), None);
+        assert!(dir.is_dir());
+    }
+
+    #[test]
+    fn a_reopened_store_continues_from_the_last_block() {
+        let dir = temp_dir("restart");
+        let mut store = open(&dir);
+        let genesis_id = connect_genesis(&mut store);
+        let first = block(1, genesis_id, MINER, vec![transfer(1)]);
+        put(&mut store, &first);
+        let diff = credit(&store, MINER, 10);
+        let tip = connect(&mut store, &first, &diff).unwrap();
+        let miner_balance = balance(&store, &MINER);
+        drop(store);
+
+        let mut store = open(&dir);
+        {
+            let reader = store::read(&store).unwrap();
+            assert_eq!(store::tip(&reader).unwrap(), Some(tip));
+            assert_eq!(
+                store::canonical_id(&reader, Height(0)).unwrap(),
+                Some(genesis_id)
+            );
+            assert_eq!(
+                store::canonical_id(&reader, Height(1)).unwrap(),
+                Some(tip.id)
+            );
+            assert_eq!(
+                store::header(&reader, &tip.id).unwrap(),
+                Some(&first.header)
+            );
+            let stored = store::block(&reader, &tip.id).unwrap().unwrap();
+            assert_eq!(store::decode(&stored).unwrap(), first);
+            let location = store::tx_location(&reader, &txid(&transfer(1)))
+                .unwrap()
+                .unwrap();
+            assert_eq!(location.block, tip.id);
+            assert_eq!(location.height, Height(1));
+        }
+        assert_eq!(balance(&store, &MINER), miner_balance);
+
+        let second = block(2, tip.id, MINER, vec![transfer(2)]);
+        put(&mut store, &second);
+        let diff = credit(&store, MINER, 10);
+        let next = connect(&mut store, &second, &diff).unwrap();
+        assert_eq!(next.height, Height(2));
+    }
+
+    #[test]
+    fn a_block_disconnected_after_a_restart_restores_the_state() {
+        let dir = temp_dir("undo");
+        let mut store = open(&dir);
+        let genesis_id = connect_genesis(&mut store);
+        let first = block(1, genesis_id, MINER, vec![transfer(1)]);
+        put(&mut store, &first);
+        let diff = credit(&store, MINER, 10);
+        connect(&mut store, &first, &diff).unwrap();
+        let after_genesis = Amount(100);
+        assert_eq!(balance(&store, &MINER), Some(Amount(110)));
+        drop(store);
+
+        let mut store = open(&dir);
+        let parent = disconnect(&mut store, &first).unwrap();
+        assert_eq!(parent.id, genesis_id);
+        assert_eq!(balance(&store, &MINER), Some(after_genesis));
+        drop(store);
+
+        let store = open(&dir);
+        let reader = store::read(&store).unwrap();
+        assert_eq!(store::tip(&reader).unwrap().unwrap().id, genesis_id);
+        assert_eq!(store::canonical_id(&reader, Height(1)).unwrap(), None);
+        assert_eq!(
+            store::tx_location(&reader, &txid(&transfer(1))).unwrap(),
+            None
+        );
+        assert_eq!(balance_of(&reader), Some(after_genesis));
+    }
+
+    #[test]
+    fn the_circuit_registry_survives_a_restart() {
+        let dir = temp_dir("circuits");
+        let mut store = open(&dir);
+        let genesis_id = connect_genesis(&mut store);
+        let entry = pouw_types::CircuitEntry {
+            id: pouw_types::CircuitId(TxId(Hash32([7; 32]))),
+            system: pouw_types::ProofSystem::Groth16,
+            constraint_count: pouw_types::ConstraintCount(5),
+            owner: MINER,
+            registered_at: Height(1),
+            verifying_key: Box::from([1, 2, 3]),
+            circuit: Box::from([4, 5, 6]),
+        };
+        let diff = {
+            let reader = store::read(&store).unwrap();
+            let mut overlay = ChainState {
+                base: &reader,
+                diff: StateDiff::default(),
+            };
+            state::set_circuit(&mut overlay, entry.clone()).unwrap();
+            overlay.diff
+        };
+        let first = block(1, genesis_id, MINER, vec![transfer(1)]);
+        put(&mut store, &first);
+        connect(&mut store, &first, &diff).unwrap();
+        assert_eq!(
+            store::read(&store).unwrap().circuit(&entry.id).unwrap(),
+            Some(&entry)
+        );
+        drop(store);
+
+        let mut store = open(&dir);
+        assert_eq!(
+            store::read(&store).unwrap().circuit(&entry.id).unwrap(),
+            Some(&entry)
+        );
+        disconnect(&mut store, &first).unwrap();
+        assert_eq!(
+            store::read(&store).unwrap().circuit(&entry.id).unwrap(),
+            None
+        );
+        drop(store);
+
+        let store = open(&dir);
+        assert_eq!(
+            store::read(&store).unwrap().circuit(&entry.id).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn headers_and_failed_marks_survive_a_restart() {
+        let dir = temp_dir("headers");
+        let mut store = open(&dir);
+        let genesis_id = connect_genesis(&mut store);
+        let side = block(1, genesis_id, MINER, vec![transfer(1)]);
+        let side_id = put(&mut store, &side);
+        store::mark_failed(&mut store, &side_id).unwrap();
+        drop(store);
+
+        let store = open(&dir);
+        let reader = store::read(&store).unwrap();
+        assert_eq!(
+            store::header(&reader, &side_id).unwrap(),
+            Some(&side.header)
+        );
+        assert!(entry(&store, &side_id).status.contains(Status::FAILED));
+        assert!(entry(&store, &side_id).status.contains(Status::BODY_STORED));
+    }
+
+    #[test]
+    fn a_store_of_another_schema_version_is_refused_after_a_reopen() {
+        let dir = temp_dir("schema");
+        let mut store = open(&dir);
+        set_schema_version(&mut store, SCHEMA_VERSION.wrapping_add(1));
+        drop(store);
+        let error = store::open(StoreKind::Rocksdb, &dir).unwrap_err();
+        assert!(matches!(error, StoreError::SchemaMismatch { .. }));
+    }
 }

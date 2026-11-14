@@ -516,7 +516,7 @@ fn the_bytes_a_peer_sent_are_the_bytes_stored_and_served() {
     {
         let reader = store::read(&h.state.store).unwrap();
         let stored = store::block(&reader, &id).unwrap().unwrap();
-        assert_eq!(stored.bytes, received.as_slice());
+        assert_eq!(stored.bytes.as_ref(), received.as_slice());
     }
     assert_eq!(
         api::block(&h.state.store, &id).unwrap(),
