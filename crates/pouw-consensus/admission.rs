@@ -43,7 +43,7 @@ pub fn minimum_fee(params: &ConsensusParams, kind: &TxKind) -> Option<Amount> {
 pub fn cost(body: &TxBody) -> Option<Amount> {
     match &body.kind {
         TxKind::Transfer { amount, .. } => amount.checked_add(body.fee),
-        TxKind::ProofRequest { .. } | TxKind::RegisterCircuit { .. } => Some(body.fee),
+        _ => Some(body.fee),
     }
 }
 
@@ -69,6 +69,16 @@ pub fn check_admission<V: StateView + ?Sized>(
     queued: &[&TxBody],
 ) -> Result<(), AdmissionError> {
     let body = &tx.body;
+    if !matches!(
+        body.kind,
+        TxKind::Transfer { .. } | TxKind::ProofRequest { .. } | TxKind::RegisterCircuit { .. }
+    ) {
+        return Err(InvalidTx::WrongKind {
+            kind: "unknown",
+            place: "the mempool",
+        }
+        .into());
+    }
     let account = view.account(&body.sender)?.unwrap_or_default();
     if body.nonce < account.nonce {
         return Err(InvalidTx::BadNonce {
