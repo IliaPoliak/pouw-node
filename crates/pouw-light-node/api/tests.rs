@@ -7,11 +7,12 @@ use std::{
     thread,
 };
 
-use pouw_api::view::{HeaderView, IncludedProof, SignedTxView, TxStatus, TxView};
+use pouw_api::view::{HeaderView, IncludedProof, InclusionProof, SignedTxView, TxStatus, TxView};
 use pouw_crypto::{Address, FieldInput, Hash32, Signature};
 use pouw_types::{
     Amount, BlockHeader, BlockId, ChainId, CircuitId, Height, Nonce, ProofHash, ProofSystem,
-    SignedTx, Target, TxBody, TxId, TxKind, U32, U64, UsageCounter, block_id,
+    SignedTx, Target, TxBody, TxId, TxKind, U32, U64, UsageCounter, block_id, bound_root,
+    inclusion_proof, leaf_count_u32, merkle_root,
 };
 use serde_json::{Value, json};
 
@@ -457,18 +458,14 @@ fn a_pending_proof_request_is_a_pending_proof_job() {
 
 #[test]
 fn an_included_proof_request_names_its_proof_and_the_block_of_the_light_nodes_own_headers() {
-    let tx = request();
-    let txid = text(&SignedTxView::from(&tx).txid);
-    let (url, node) = fake_node(vec![http(
-        "200 OK",
-        "application/json",
-        &tx_view(&tx, Some(3)),
-    )]);
-    let (api, headers) = api_asking("jobincluded", 5, &url);
-    let (status, body) = call(&api, &format!("/v1/light/proof-jobs/{txid}"), true);
+    let txid = text(&SignedTxView::from(&request()).txid);
+    let leaves = leaves();
+    let headers = rooted_chain(5, 3, root_of(&leaves));
+    let proof = http("200 OK", "application/json", &inclusion_json(3, &leaves, 1));
+    let (status, job) = job_with("jobincluded", &headers, 3, proof);
     assert_eq!(status, 200);
     assert_eq!(
-        json_of(&body),
+        job,
         json!({
             "txid": txid,
             "status": "included",
@@ -477,7 +474,6 @@ fn an_included_proof_request_names_its_proof_and_the_block_of_the_light_nodes_ow
             "block": text(&block_id(&headers[3])),
         })
     );
-    node.join().unwrap();
 }
 
 #[test]
@@ -510,4 +506,106 @@ fn a_tx_that_is_not_a_proof_request_or_is_unknown_is_not_a_proof_job() {
         assert_eq!(error_code(&body), json!("unknown_proof_job"));
     }
     node.join().unwrap();
+}
+
+/// The leaves of a block of three entries. The second is the proof hash of the tx views
+/// of `tx_view`.
+fn leaves() -> Vec<Hash32> {
+    vec![Hash32([1; 32]), Hash32([5; 32]), Hash32([3; 32])]
+}
+
+/// The `tx_root` of a block with these leaves.
+fn root_of(leaves: &[Hash32]) -> Hash32 {
+    bound_root(leaf_count_u32(leaves.len()), &merkle_root(leaves))
+}
+
+/// A chain of `count` headers in which the one at height `at` has the `tx_root` `root`.
+fn rooted_chain(count: u64, at: u64, root: Hash32) -> Vec<BlockHeader> {
+    let mut headers = Vec::new();
+    let mut parent = BlockId::ZERO;
+    for height in 0..count {
+        let mut next = header(height, parent);
+        if height == at {
+            next.tx_root = root;
+        }
+        parent = block_id(&next);
+        headers.push(next);
+    }
+    headers
+}
+
+/// The JSON of `GET /v1/txs/{txid}/inclusion-proof` for leaf `index` of `leaves`.
+fn inclusion_json(height: u64, leaves: &[Hash32], index: usize) -> Vec<u8> {
+    let path = inclusion_proof(leaves, index).unwrap();
+    serde_json::to_vec(&InclusionProof {
+        height: Height(height),
+        index: path.index,
+        leaf_count: path.leaf_count,
+        siblings: path.siblings,
+    })
+    .unwrap()
+}
+
+/// The status and the body of the proof job of `request()` for a light node holding
+/// `headers`, when its full node says the tx is included at height `at` and then gives
+/// `proof_answer` (a whole HTTP answer) as the inclusion proof.
+fn job_with(name: &str, headers: &[BlockHeader], at: u64, proof_answer: Vec<u8>) -> (u16, Value) {
+    let tx = request();
+    let txid = text(&SignedTxView::from(&tx).txid);
+    let (url, node) = fake_node(vec![
+        http("200 OK", "application/json", &tx_view(&tx, Some(at))),
+        proof_answer,
+    ]);
+    let mut store = HeaderStore::open(&path(name), 8).unwrap();
+    for next in headers {
+        store.push(*next).unwrap();
+    }
+    let api = LightApi::new(store, Upstream::new(&[url]));
+    let (status, body) = call(&api, &format!("/v1/light/proof-jobs/{txid}"), true);
+    node.join().unwrap();
+    (status, json_of(&body))
+}
+
+#[test]
+fn a_proof_job_is_not_included_when_the_proof_does_not_fit_the_local_header() {
+    let leaves = leaves();
+    let json = |body: &[u8]| http("200 OK", "application/json", body);
+    let invalid = |(status, job): (u16, Value)| {
+        assert_eq!(status, 502);
+        assert_eq!(job["error"]["code"], json!("upstream_invalid"));
+    };
+
+    // the full node is on another chain: the block of the light node at height 3 has a
+    // tx_root that does not commit to these leaves
+    let divergent = rooted_chain(5, 3, Hash32([0xaa; 32]));
+    invalid(job_with(
+        "divergent",
+        &divergent,
+        3,
+        json(&inclusion_json(3, &leaves, 1)),
+    ));
+
+    let headers = rooted_chain(5, 3, root_of(&leaves));
+    // the path of another leaf
+    invalid(job_with(
+        "otherleaf",
+        &headers,
+        3,
+        json(&inclusion_json(3, &leaves, 0)),
+    ));
+    // a path that is right but claims another height
+    invalid(job_with(
+        "otherheight",
+        &headers,
+        3,
+        json(&inclusion_json(2, &leaves, 1)),
+    ));
+    // no inclusion proof, or one that does not parse
+    invalid(job_with(
+        "noproof",
+        &headers,
+        3,
+        http("404 Not Found", "application/json", b"{}"),
+    ));
+    invalid(job_with("garbage", &headers, 3, json(b"not json")));
 }

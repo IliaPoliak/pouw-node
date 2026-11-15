@@ -6,8 +6,12 @@
 //! `GET /health`. Asked of a full node (`POUW_FULL_NODES`) and passed on: the block,
 //! `GET /v1/accounts/{addr}`, `GET /v1/txs/{txid}` and its `/inclusion-proof`.
 //! `GET /v1/light/proof-jobs/{txid}` is built from the tx of a full node and the
-//! headers of the store. A header is borsh by default and the JSON view when `Accept` names
-//! `application/json`, as in the full node API.
+//! headers of the store, and an included job is reported only when the inclusion proof
+//! of the full node verifies against the `tx_root` of the header the store holds at that
+//! height (`upstream_invalid` otherwise).
+//!
+//! A header is borsh by default and the JSON view when `Accept` names `application/json`,
+//! as in the full node API.
 //!
 //! A header is found by its height or by its `blk:` id at any depth, the store keeps
 //! an index of the ids.
@@ -29,10 +33,12 @@ use std::{
 use pouw_api::{
     error::{ErrorBody, code},
     path::{HEADERS, HEALTH},
-    view::{HeaderView, HeadersPage, MAX_HEADERS_PER_CALL, TxStatus, TxView},
+    view::{HeaderView, HeadersPage, InclusionProof, MAX_HEADERS_PER_CALL, TxStatus, TxView},
 };
 use pouw_crypto::Address;
-use pouw_types::{BlockHeader, BlockId, ChainId, Height, ProofHash, TxId, TxKind, block_id};
+use pouw_types::{
+    BlockHeader, BlockId, ChainId, Height, ProofHash, TxId, TxKind, block_id, verify_inclusion,
+};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tracing::{debug, warn};
@@ -145,6 +151,14 @@ impl Reply {
             "502 Bad Gateway",
             "upstream_unavailable",
             "no full node answered",
+        )
+    }
+
+    fn invalid_upstream() -> Self {
+        Self::error(
+            "502 Bad Gateway",
+            "upstream_invalid",
+            "the inclusion proof of the full node does not match the header of the light node",
         )
     }
 
@@ -269,6 +283,43 @@ enum ProofJob {
     },
 }
 
+/// Asks a full node for the inclusion proof of `txid` and checks it against the
+/// `tx_root` of `header`, the header the light node holds at `height`. A full node on
+/// another chain, or one that lies, cannot make the light node report a block that never
+/// held the proof.
+fn check_inclusion(
+    api: &LightApi,
+    txid: &str,
+    height: Height,
+    header: &BlockHeader,
+    leaf: &ProofHash,
+) -> Result<(), Reply> {
+    let answer = api
+        .upstream
+        .get(&format!("/v1/txs/{txid}/inclusion-proof"), true)
+        .map_err(|error| {
+            warn!(%error, "cannot ask a full node");
+            Reply::bad_gateway()
+        })?;
+    let valid = answer.status == 200
+        && serde_json::from_slice::<InclusionProof>(&answer.body).is_ok_and(|proof| {
+            proof.height == height
+                && verify_inclusion(
+                    &header.tx_root,
+                    &leaf.0,
+                    proof.index,
+                    proof.leaf_count,
+                    &proof.siblings,
+                )
+        });
+    if valid {
+        Ok(())
+    } else {
+        warn!(%txid, "the inclusion proof of a full node does not match the local header");
+        Err(Reply::invalid_upstream())
+    }
+}
+
 fn proof_job(api: &LightApi, txid: &str) -> Reply {
     let Some(txid) = typed::<TxId>(txid) else {
         return Reply::bad_request("not a tx: id");
@@ -293,8 +344,8 @@ fn proof_job(api: &LightApi, txid: &str) -> Reply {
     let job = match (view.status, view.height, view.proof) {
         (TxStatus::Pending, _, _) => ProofJob::Pending { txid: view.txid },
         (TxStatus::Included, Some(height), Some(proof)) => {
-            let block = match api.read(|store| store.get(height)) {
-                Ok(Some(header)) => block_id(&header),
+            let held = match api.read(|store| store.get(height)) {
+                Ok(Some(held)) => held,
                 Ok(None) => {
                     return Reply::not_found(
                         UNKNOWN_BLOCK,
@@ -303,11 +354,14 @@ fn proof_job(api: &LightApi, txid: &str) -> Reply {
                 }
                 Err(reply) => return reply,
             };
+            if let Err(reply) = check_inclusion(api, &txid, height, &held, &proof.proof_hash) {
+                return reply;
+            }
             ProofJob::Included {
                 txid: view.txid,
                 proof_hash: proof.proof_hash,
                 height,
-                block,
+                block: block_id(&held),
             }
         }
         (TxStatus::Included, _, _) => {
