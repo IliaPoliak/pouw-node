@@ -213,3 +213,36 @@ fn a_file_of_another_kind_is_refused() {
         Err(StoreError::BadMagic)
     ));
 }
+
+#[test]
+fn a_header_is_found_by_id_at_any_depth() {
+    let headers = chain(6);
+    let mut store = HeaderStore::open(&path("find"), 2).unwrap();
+    push_all(&mut store, &headers);
+    for wanted in &headers {
+        assert_eq!(store.find(&block_id(wanted)).unwrap(), Some(*wanted));
+    }
+    assert_eq!(store.find(&BlockId(Hash32([9; 32]))).unwrap(), None);
+    assert_eq!(store.get(Height(1)).unwrap(), Some(headers[1]));
+}
+
+#[test]
+fn the_index_of_ids_survives_a_restart_and_follows_pop() {
+    let headers = chain(6);
+    let file = path("index");
+    {
+        let mut store = HeaderStore::open(&file, 2).unwrap();
+        push_all(&mut store, &headers);
+    }
+    let mut store = HeaderStore::open(&file, 2).unwrap();
+    assert_eq!(
+        store.find(&block_id(&headers[0])).unwrap(),
+        Some(headers[0])
+    );
+    store.pop().unwrap();
+    assert_eq!(store.find(&block_id(&headers[5])).unwrap(), None);
+    assert_eq!(
+        store.find(&block_id(&headers[4])).unwrap(),
+        Some(headers[4])
+    );
+}

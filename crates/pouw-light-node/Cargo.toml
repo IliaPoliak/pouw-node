@@ -16,8 +16,12 @@ name = "pouw-light-node"
 path = "pouw-light-node-main.rs"
 
 [dependencies]
+borsh.workspace = true
 pouw-api.workspace = true
+pouw-consensus.workspace = true
 pouw-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 signal-hook.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

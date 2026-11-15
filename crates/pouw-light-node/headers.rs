@@ -2,7 +2,9 @@
 //! body or the state. The headers are one file of fixed-size records, so the header of
 //! height `h` is at a known offset and an old header is read without a scan. The last N
 //! headers are also kept in memory, which serves the tip and the recent heights without
-//! touching the file.
+//! touching the file. An index of the ids of all headers (an id and a height each, 40
+//! bytes) is read from the file when it is opened, so a header is also found by its id
+//! at any depth.
 //!
 //! The first header stored is the anchor, the genesis block or a later checkpoint, and
 //! each next header must extend the tip: parent id, chain id and height are checked.
@@ -16,7 +18,7 @@
 //! dropped when the file is opened, so the store continues from the last whole header.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs::{File, OpenOptions},
     io,
     os::unix::fs::FileExt,
@@ -60,6 +62,8 @@ pub struct HeaderStore {
     capacity: usize,
     /// The last `capacity` headers with their ids, oldest first.
     cache: VecDeque<(BlockId, BlockHeader)>,
+    /// The height of every stored header by its id.
+    index: HashMap<BlockId, u64>,
 }
 
 fn offset(index: u64) -> Result<u64, StoreError> {
@@ -143,10 +147,12 @@ impl HeaderStore {
             len,
             capacity: cache.max(1),
             cache: VecDeque::new(),
+            index: HashMap::new(),
         };
         if len > 0 {
             store.first = store.read_at(0)?.height.get();
             store.load_tail()?;
+            store.load_index()?;
         }
         Ok(store)
     }
@@ -177,6 +183,20 @@ impl HeaderStore {
         self.cache.len()
     }
 
+    /// The header with id `id` at any depth: the index of ids gives its height and
+    /// [`HeaderStore::get`] reads it from memory or from the file. `None` for an id the
+    /// store does not hold.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] when the file cannot be read.
+    pub fn find(&self, id: &BlockId) -> Result<Option<BlockHeader>, StoreError> {
+        match self.index.get(id) {
+            Some(height) => self.get(Height(*height)),
+            None => Ok(None),
+        }
+    }
+
     /// Appends `header`. The first header of an empty store is accepted as the anchor,
     /// every other one must extend the tip.
     ///
@@ -200,7 +220,9 @@ impl HeaderStore {
             self.first = header.height.get();
         }
         self.len = new_len;
-        self.cache.push_back((block_id(&header), header));
+        let id = block_id(&header);
+        self.index.insert(id, header.height.get());
+        self.cache.push_back((id, header));
         if self.cache.len() > self.capacity {
             self.cache.pop_front();
         }
@@ -213,13 +235,14 @@ impl HeaderStore {
     ///
     /// [`StoreError::Io`] when the file cannot be shortened or read.
     pub fn pop(&mut self) -> Result<Option<BlockHeader>, StoreError> {
-        let Some(header) = self.cache.back().map(|(_, header)| *header) else {
+        let Some((tip_id, header)) = self.cache.back().map(|(id, header)| (*id, *header)) else {
             return Ok(None);
         };
         let new_len = self.len.saturating_sub(1);
         self.file.set_len(offset(new_len)?)?;
         self.file.sync_all()?;
         self.len = new_len;
+        self.index.remove(&tip_id);
         self.load_tail()?;
         Ok(Some(header))
     }
@@ -255,6 +278,16 @@ impl HeaderStore {
         BlockHeader::read_from_bytes(&bytes)
             .ok()
             .ok_or_else(|| StoreError::Corrupt(format!("record {index} is not a header")))
+    }
+
+    /// Reads every record once and notes its id and height.
+    fn load_index(&mut self) -> Result<(), StoreError> {
+        self.index.clear();
+        for index in 0..self.len {
+            let header = self.read_at(index)?;
+            self.index.insert(block_id(&header), header.height.get());
+        }
+        Ok(())
     }
 
     /// Fills the cache with the last `capacity` headers and checks that they link and
