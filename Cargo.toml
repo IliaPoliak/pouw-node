@@ -32,6 +32,7 @@ panic = "abort"
 panic = "abort"
 
 [workspace.dependencies]
+axum = { version = "0.8.4", default-features = false, features = ["http1", "json", "query", "tokio"] }
 futures = { version = "0.3.31", default-features = false, features = ["std"] }
 libp2p = { version = "0.57.1", default-features = false, features = ["tokio", "tcp", "dns", "noise", "yamux", "identify", "kad", "ed25519", "macros"] }
 base64 = "0.22.1"
