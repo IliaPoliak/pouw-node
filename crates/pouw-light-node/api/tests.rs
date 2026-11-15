@@ -86,7 +86,7 @@ fn the_head_is_the_tip_with_its_chain_id() {
     assert_eq!(head["height"], json!(4));
     assert_eq!(head["chain_id"], json!(7));
     assert_eq!(
-        head["hash"],
+        head["id"],
         serde_json::to_value(block_id(&headers[4])).unwrap()
     );
 }
@@ -138,14 +138,14 @@ fn an_unknown_or_malformed_block_is_404_or_400() {
 }
 
 #[test]
-fn an_old_header_is_found_by_height_but_not_by_id() {
+fn an_old_header_is_found_by_height_and_by_id() {
     let (api, headers) = api_with("old", 6, 2);
     let old = block_id(&headers[1]);
     let (status, _) = call(&api, "/v1/blocks/1/header", true);
     assert_eq!(status, 200);
     let (status, body) = call(&api, &format!("/v1/blocks/{old}/header"), true);
-    assert_eq!(status, 404);
-    assert_eq!(error_code(&body), json!("unknown_block"));
+    assert_eq!(status, 200);
+    assert_eq!(serde_json::from_slice::<HeaderView>(&body).unwrap().id, old);
 }
 
 #[test]

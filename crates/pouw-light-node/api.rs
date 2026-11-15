@@ -6,8 +6,8 @@
 //! `GET /health`. A header is borsh by default and the JSON view when `Accept` names
 //! `application/json`, as in the full node API.
 //!
-//! The light node keeps no index by id, so a header is found by its `blk:` id only
-//! while it is among the last N headers in memory; any header is found by its height.
+//! A header is found by its height or by its `blk:` id at any depth, the store keeps
+//! an index of the ids.
 //!
 //! Errors have the shape `{"error": {"code", "message"}}` with the codes of the light
 //! contract: `bad_request` (400), `unknown_block` (404), `range_too_large` (422).
@@ -79,7 +79,7 @@ impl LightApi {
 struct LightHead {
     chain_id: ChainId,
     height: Height,
-    hash: BlockId,
+    id: BlockId,
 }
 
 struct Reply {
@@ -169,7 +169,7 @@ fn head(api: &LightApi) -> Reply {
         Ok(store.get(height)?.map(|header| LightHead {
             chain_id: ChainId(header.chain_id.get()),
             height,
-            hash,
+            id: hash,
         }))
     });
     match answer {
@@ -183,7 +183,7 @@ fn header(api: &LightApi, key: &str, json: bool) -> Reply {
     let found = match block_key(key) {
         None => return Reply::bad_request("not a height or a blk: id"),
         Some(Key::Height(height)) => api.read(|store| store.get(height)),
-        Some(Key::Id(id)) => api.read(|store| Ok(store.find(&id))),
+        Some(Key::Id(id)) => api.read(|store| store.find(&id)),
     };
     let header: BlockHeader = match found {
         Ok(Some(header)) => header,
