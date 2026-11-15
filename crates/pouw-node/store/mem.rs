@@ -98,6 +98,13 @@ pub fn circuit<'v>(view: &'v Mem, id: &CircuitId) -> Result<Option<&'v CircuitEn
     view.state.circuit(id)
 }
 
+/// Every registered circuit, ascending by height of registration and then by id.
+pub fn circuits(view: &Mem) -> Vec<CircuitEntry> {
+    let mut entries: Vec<CircuitEntry> = view.state.circuits.values().cloned().collect();
+    entries.sort_by_key(|entry| (entry.registered_at, entry.id));
+    entries
+}
+
 pub fn usage_counter(
     view: &Mem,
     miner: &Address,

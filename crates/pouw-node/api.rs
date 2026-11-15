@@ -12,19 +12,24 @@ use std::net::SocketAddr;
 use pouw_api::{
     event::EventsPage,
     view::{
-        AccountView, BlockView, HeaderView, MAX_BLOCKS_PER_CALL, MAX_HEADERS_PER_CALL, MempoolView,
-        NodeInfo, ProofTxView,
+        AccountView, BlockView, CircuitView, HeaderView, IncludedProof, InclusionProof,
+        MAX_BLOCKS_PER_CALL, MAX_HEADERS_PER_CALL, MempoolView, NodeInfo, ProofTxView,
+        SignedTxView, TxStatus, TxView,
     },
 };
 use pouw_consensus::{ChainTip, InvalidTx, StateView};
 use pouw_crypto::{Address, hash_to_field};
-use pouw_types::{BlockId, ChainId, Height, TxId, TxKind, eta_chain, mask};
+use pouw_types::{
+    Block, BlockId, ChainId, CircuitId, Height, SignedTx, TxId, TxKind, eta_chain, inclusion_proof,
+    mask,
+};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     chain::TxOutcome,
     events::{self, CursorExpired, EventLog},
+    mempool::{self, Mempool},
     node::ComponentFault,
     precheck::CheckedTx,
     store::{self, Reader, Store, StoreError, TxLocation},
@@ -73,6 +78,15 @@ pub enum Ranged<T> {
     FromAboveTo,
     /// The range holds more than one call may take.
     TooLarge,
+}
+
+/// What a transaction lookup gave.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxReply {
+    /// The borsh bytes of the transaction (for a proof request, the request).
+    Bytes(Vec<u8>),
+    /// The view, which says whether the transaction is pending or included.
+    View(Box<TxView>),
 }
 
 #[derive(Debug)]
@@ -134,6 +148,28 @@ pub enum ApiRequest {
         to: Option<u64>,
         reply: oneshot::Sender<Result<Ranged<HeaderView>, StoreError>>,
     },
+    /// One transaction of the canonical chain or of the mempool, as bytes or as the view.
+    Tx {
+        id: TxId,
+        json: bool,
+        reply: Answer<TxReply>,
+    },
+    /// The Merkle inclusion proof of a transaction of the canonical chain.
+    Inclusion {
+        id: TxId,
+        reply: Answer<InclusionProof>,
+    },
+    /// Every registered circuit, with the key blobs when `keys`.
+    Circuits {
+        keys: bool,
+        reply: oneshot::Sender<Result<Vec<CircuitView>, StoreError>>,
+    },
+    /// One registered circuit, with the key blobs when `keys`.
+    Circuit {
+        id: CircuitId,
+        keys: bool,
+        reply: Answer<CircuitView>,
+    },
     /// The text of `/metrics`.
     Metrics { reply: oneshot::Sender<String> },
 }
@@ -162,9 +198,8 @@ pub fn submit(api: &mpsc::Sender<ApiRequest>, request: ApiRequest) -> Result<(),
 /// The API server thread: turns HTTP calls on `addr` into answers, see
 /// [`crate::http`]. With `fixtures` set it is the mock node of pouw-node#59 and answers
 /// the routes of [`pouw_api::path`] from the fixture chain. Without it the routes ask
-/// the node loop through `api` and [`submit`] (a full queue answers 503); the routes of
-/// one transaction, its inclusion proof and the circuits answer 501 until pouw-node#81
-/// is done. The thread runs until the process ends.
+/// the node loop through `api` and [`submit`] (a full queue answers 503). The thread
+/// runs until the process ends.
 pub fn serve(
     addr: SocketAddr,
     fixtures: Option<&std::path::Path>,
@@ -335,6 +370,159 @@ pub fn headers(
             .map(HeaderView::from)
             .ok_or(StoreError::UnknownBlock(*id))
     })
+}
+
+/// A transaction of the canonical chain with its block and its leaf in the Merkle tree.
+struct Located {
+    location: TxLocation,
+    block: Block,
+    index: usize,
+}
+
+fn locate(reader: &Reader<'_>, id: &TxId) -> Result<Option<Located>, StoreError> {
+    let Some(location) = store::tx_location(reader, id)? else {
+        return Ok(None);
+    };
+    let stored =
+        store::block(reader, &location.block)?.ok_or(StoreError::UnknownBlock(location.block))?;
+    let block = store::decode(&stored)?;
+    let index = usize::try_from(location.index).unwrap_or(usize::MAX);
+    if index >= block.leaf_count() {
+        return Err(StoreError::Corrupt(format!(
+            "tx {id} is indexed at leaf {index} of block {}, which has {} leaves",
+            location.block,
+            block.leaf_count()
+        )));
+    }
+    Ok(Some(Located {
+        location,
+        block,
+        index,
+    }))
+}
+
+fn encode(tx: &SignedTx) -> Result<Vec<u8>, StoreError> {
+    borsh::to_vec(tx)
+        .map_err(|fault| StoreError::Corrupt(format!("a transaction cannot be encoded: {fault}")))
+}
+
+/// A transaction the chain does not hold, if the mempool does.
+fn pending(pool: &Mempool, id: &TxId, json: bool) -> Result<Option<TxReply>, StoreError> {
+    let Some(tx) = mempool::get(pool, id) else {
+        return Ok(None);
+    };
+    if !json {
+        return encode(tx).map(|bytes| Some(TxReply::Bytes(bytes)));
+    }
+    Ok(Some(TxReply::View(Box::new(TxView {
+        txid: *id,
+        status: TxStatus::Pending,
+        tx: SignedTxView::from(tx),
+        height: None,
+        index: None,
+        proof: None,
+    }))))
+}
+
+/// `GET /v1/txs/{txid}`: a transaction of the canonical chain, else one of the mempool.
+/// For a proof request the answer is the request, and the view carries the fields of its
+/// proof tx.
+pub fn tx(
+    store: &Store,
+    pool: &Mempool,
+    id: &TxId,
+    json: bool,
+) -> Result<Option<TxReply>, StoreError> {
+    let reader = store::read(store)?;
+    let Some(Located {
+        location,
+        block,
+        index,
+    }) = locate(&reader, id)?
+    else {
+        return pending(pool, id, json);
+    };
+    let (request, proof_at) = if let Some(tx) = block.txs.get(index) {
+        (tx, None)
+    } else {
+        let at = index.saturating_sub(block.txs.len());
+        let proof_tx = block.proof_txs.get(at).ok_or_else(|| {
+            StoreError::Corrupt(format!("block {} has no leaf {index}", location.block))
+        })?;
+        (&proof_tx.request, Some(at))
+    };
+    if !json {
+        return encode(request).map(|bytes| Some(TxReply::Bytes(bytes)));
+    }
+    let proof = match proof_at {
+        None => None,
+        Some(at) => {
+            let derived = view_of(&reader, &block)?
+                .proof_txs
+                .into_iter()
+                .nth(at)
+                .ok_or_else(|| {
+                    StoreError::Corrupt(format!("block {} has no proof tx {at}", location.block))
+                })?;
+            Some(IncludedProof {
+                eta: derived.eta,
+                mask: derived.mask,
+                proof_system: derived.proof_system,
+                usage_counter: derived.usage_counter,
+                proof: derived.proof,
+                proof_hash: derived.proof_hash,
+            })
+        }
+    };
+    Ok(Some(TxReply::View(Box::new(TxView {
+        txid: *id,
+        status: TxStatus::Included,
+        tx: SignedTxView::from(request),
+        height: Some(location.height),
+        index: Some(location.index),
+        proof,
+    }))))
+}
+
+/// `GET /v1/txs/{txid}/inclusion`: the path of the leaf of a transaction of the canonical
+/// chain. A pending transaction has none.
+pub fn inclusion(store: &Store, id: &TxId) -> Result<Option<InclusionProof>, StoreError> {
+    let reader = store::read(store)?;
+    let Some(found) = locate(&reader, id)? else {
+        return Ok(None);
+    };
+    let path = inclusion_proof(&found.block.leaf_ids(), found.index).map_err(|fault| {
+        StoreError::Corrupt(format!(
+            "no inclusion proof for the stored tx {id}: {fault}"
+        ))
+    })?;
+    Ok(Some(InclusionProof {
+        height: found.location.height,
+        index: path.index,
+        leaf_count: path.leaf_count,
+        siblings: path.siblings,
+    }))
+}
+
+/// `GET /v1/circuits`: the registry at the tip, ascending by height of registration and
+/// then by id.
+pub fn circuits(store: &Store, keys: bool) -> Result<Vec<CircuitView>, StoreError> {
+    let reader = store::read(store)?;
+    Ok(store::circuits(&reader)?
+        .iter()
+        .map(|entry| CircuitView::new(entry, keys))
+        .collect())
+}
+
+/// `GET /v1/circuits/{id}`.
+pub fn circuit(
+    store: &Store,
+    id: &CircuitId,
+    keys: bool,
+) -> Result<Option<CircuitView>, StoreError> {
+    let reader = store::read(store)?;
+    let entry = reader.circuit(id)?;
+    Ok(entry.map(|entry| CircuitView::new(entry, keys)))
 }
 
 /// `GET /v1/node`: the chain id of the node, its version, the height of the tip and the

@@ -3,7 +3,9 @@ use axum::{
     http::{HeaderValue, StatusCode},
 };
 use pouw_crypto::{Hash32, SigningKey};
-use pouw_types::{ChainId, Target, TxBody, U32, U64, block_id, sign_body};
+use pouw_types::{
+    ChainId, ConstraintCount, ProofSystem, Target, TxBody, U32, U64, block_id, sign_body,
+};
 
 use super::*;
 
@@ -423,4 +425,145 @@ fn a_node_that_does_not_answer_is_busy() {
     crate::api::submit(&app.api, ApiRequest::Mempool { reply }).unwrap();
     let response = block_on(mempool(State(app)));
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+fn entry(seed: u8) -> CircuitEntry {
+    CircuitEntry {
+        id: CircuitId(TxId(Hash32([seed; 32]))),
+        system: ProofSystem::Groth16,
+        constraint_count: ConstraintCount(7),
+        owner: Address([1; 32]),
+        registered_at: Height(1),
+        verifying_key: Box::from([1, 2, 3]),
+        circuit: Box::from([4, 5]),
+    }
+}
+
+#[test]
+fn a_live_tx_is_the_stored_bytes_or_the_view_and_an_unknown_one_is_404() {
+    let known = signed(0);
+    let id = txid(&known);
+    let served = known.clone();
+    let app = live(move |request| {
+        let ApiRequest::Tx {
+            id: asked,
+            json,
+            reply,
+        } = request
+        else {
+            panic!("unexpected request {request:?}");
+        };
+        let answer = (asked == id).then(|| {
+            if json {
+                TxReply::View(Box::new(TxView {
+                    txid: id,
+                    status: TxStatus::Included,
+                    tx: SignedTxView::from(&served),
+                    height: Some(Height(1)),
+                    index: Some(0),
+                    proof: None,
+                }))
+            } else {
+                TxReply::Bytes(borsh::to_vec(&served).unwrap())
+            }
+        });
+        reply.send(Ok(answer)).unwrap();
+    });
+    let decoded: SignedTx =
+        borsh::from_slice(&body_of(get_tx(&app, &id, HeaderMap::new()))).unwrap();
+    assert_eq!(decoded, known);
+    let json = json_of(get_tx(&app, &id, accept("application/json")));
+    assert_eq!((&json["height"], &json["index"]), (&json!(1), &json!(0)));
+    let other = txid(&signed(1));
+    assert_eq!(
+        get_tx(&app, &other, HeaderMap::new()).status(),
+        StatusCode::NOT_FOUND
+    );
+    let bad = block_on(tx(
+        State(app),
+        UrlPath("nonsense".to_owned()),
+        HeaderMap::new(),
+    ));
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn a_live_inclusion_proof_is_json_and_a_tx_without_one_is_404() {
+    let id = TxId(Hash32([7; 32]));
+    let app = live(move |request| {
+        let ApiRequest::Inclusion { id: asked, reply } = request else {
+            panic!("unexpected request {request:?}");
+        };
+        let proof = (asked == id).then(|| InclusionProof {
+            height: Height(2),
+            index: 1,
+            leaf_count: 3,
+            siblings: vec![Hash32([1; 32])],
+        });
+        reply.send(Ok(proof)).unwrap();
+    });
+    let call = |key: String| block_on(inclusion(State(app.clone()), UrlPath(key)));
+    let json = json_of(call(id.to_string()));
+    assert_eq!(
+        (&json["height"], &json["index"], &json["leaf_count"]),
+        (&json!(2), &json!(1), &json!(3))
+    );
+    let none = call(TxId(Hash32([8; 32])).to_string());
+    assert_eq!(none.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        call("nonsense".to_owned()).status(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[test]
+fn live_circuits_are_listed_and_fetched_with_keys_only_when_asked() {
+    let entries = [entry(1), entry(2)];
+    let held = entries.clone();
+    let app = live(move |request| match request {
+        ApiRequest::Circuits { keys, reply } => reply
+            .send(Ok(held
+                .iter()
+                .map(|entry| CircuitView::new(entry, keys))
+                .collect()))
+            .unwrap(),
+        ApiRequest::Circuit { id, keys, reply } => reply
+            .send(Ok(held
+                .iter()
+                .find(|entry| entry.id == id)
+                .map(|entry| CircuitView::new(entry, keys))))
+            .unwrap(),
+        other => panic!("unexpected request {other:?}"),
+    });
+    let include = |keys: bool| {
+        Query(Include {
+            include: keys.then(|| "keys".to_owned()),
+        })
+    };
+    let plain = json_of(block_on(circuits(State(app.clone()), include(false))));
+    assert_eq!(plain["circuits"].as_array().unwrap().len(), 2);
+    assert!(plain["circuits"][0].get("verifying_key").is_none());
+    let keyed = json_of(block_on(circuits(State(app.clone()), include(true))));
+    assert!(keyed["circuits"][0].get("verifying_key").is_some());
+
+    let one = block_on(circuit(
+        State(app.clone()),
+        UrlPath(entries[1].id.to_string()),
+        include(true),
+    ));
+    let one = json_of(one);
+    assert_eq!(one["id"], serde_json::to_value(entries[1].id).unwrap());
+    assert!(one.get("circuit").is_some());
+    let unknown = block_on(circuit(
+        State(app.clone()),
+        UrlPath(entry(9).id.to_string()),
+        include(false),
+    ));
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    let bad = block_on(circuit(
+        State(app),
+        UrlPath("nonsense".to_owned()),
+        include(false),
+    ));
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
 }
