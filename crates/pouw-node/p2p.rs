@@ -22,7 +22,7 @@
 //! node never awaits the transport: a full command channel drops the command and counts
 //! it in `Metrics::dropped_commands`.
 
-use std::{collections::BTreeMap, fmt, future::poll_fn, io, task::Poll};
+use std::{collections::BTreeMap, fmt, future::poll_fn, io, path::PathBuf, task::Poll};
 
 use borsh::BorshSerialize;
 use pouw_consensus::{ConsensusParams, Scratch};
@@ -38,8 +38,10 @@ use crate::{
     precheck::{self, CheckedAnnounce, CheckedTx, Fetched, PrecheckError},
 };
 
+pub mod identity;
 pub mod limits;
 pub mod protocol;
+pub mod swarm;
 
 pub use limits::{
     BAN_DURATION, BAN_SCORE, MAX_PEER_ID_BYTES, PENALTY_INVALID_BLOCK, PENALTY_INVALID_TX,
@@ -715,6 +717,9 @@ pub struct TransportConfig {
     /// Multiaddresses of the nodes to dial first and to seed discovery with.
     pub bootnodes: Vec<String>,
     pub limits: PeerLimits,
+
+    /// Directory of the node key, see [`identity`].
+    pub data_dir: PathBuf,
 }
 
 /// Builds the libp2p swarm of the node and returns the channel it feeds.
@@ -739,13 +744,8 @@ pub struct TransportConfig {
 ///
 /// Test: two swarms on one machine with the same network connect, exchange `Status`
 /// and see each other's gossip. A swarm of another network is never connected.
-pub fn start_swarm(config: &TransportConfig) -> WireIn {
-    todo!(
-        "pouw-node#85: libp2p swarm for {} on {:?} with bootnodes {:?}",
-        config.network,
-        config.listen,
-        config.bootnodes
-    )
+pub fn start_swarm(config: &TransportConfig) -> Result<WireIn, swarm::SwarmError> {
+    swarm::start(config)
 }
 
 /// The transport thread: serves the commands of `outbound` and the messages of the
@@ -758,13 +758,7 @@ pub fn run_transport(
     outbound: Outbound,
     inbound: &mpsc::Sender<Inbound>,
 ) -> Result<(), ComponentFault> {
-    warn!(
-        listen = ?config.listen,
-        bootnodes = ?config.bootnodes,
-        limits = ?config.limits,
-        "pouw-node#85: no libp2p transport, no peer connects"
-    );
-    let (_, wire) = mpsc::channel(WIRE_CAPACITY);
+    let wire = start_swarm(config).map_err(|error| ComponentFault::Swarm(Box::new(error)))?;
     serve(&config.network, params, outbound, wire, inbound)
 }
 
@@ -1043,6 +1037,7 @@ mod tests {
         NetworkName::try_from("devnet".to_owned()).unwrap()
     }
 
+    /*
     fn config() -> TransportConfig {
         TransportConfig {
             network: devnet(),
@@ -1051,6 +1046,7 @@ mod tests {
             limits: PeerLimits::default(),
         }
     }
+    */
 
     fn announce_header() -> BlockHeader {
         BlockHeader {
@@ -1241,7 +1237,8 @@ mod tests {
         send(&network, request_to(3), &mut metrics).unwrap();
         send(&network, report, &mut metrics).unwrap();
         drop(network);
-        run_transport(&config(), &params(), outbound, &inbound).unwrap();
+        let (_, wire) = mpsc::channel(WIRE_CAPACITY);
+        serve(&devnet(), &params(), outbound, wire, &inbound).unwrap();
         assert!(matches!(
             inbox.try_recv(),
             Ok(Inbound::Response {

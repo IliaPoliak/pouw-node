@@ -32,6 +32,8 @@ panic = "abort"
 panic = "abort"
 
 [workspace.dependencies]
+futures = { version = "0.3.31", default-features = false, features = ["std"] }
+libp2p = { version = "0.57.1", default-features = false, features = ["tokio", "tcp", "dns", "noise", "yamux", "identify", "kad", "ed25519", "macros"] }
 base64 = "0.22.1"
 borsh = { version = "1.5.7", features = ["derive"] }
 clap = { version = "4.5.48", features = ["derive"] }
@@ -47,7 +49,7 @@ signal-hook = "0.4.5"
 sha2 = "0.10.9"
 thiserror = "2.0.17"
 time = { version = "0.3.44", features = ["formatting", "macros", "parsing"] }
-tokio = { version = "1.53.2", default-features = false, features = ["rt", "sync", "time"] }
+tokio = { version = "1.53.2", default-features = false, features = ["rt", "sync", "time", "net", "macros"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 zerocopy = { version = "0.8.63", features = ["derive"] }

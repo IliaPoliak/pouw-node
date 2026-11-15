@@ -261,6 +261,8 @@ pub enum ComponentFault {
     BadPeerId(#[from] p2p::PeerIdTooLong),
     #[error(transparent)]
     PeerIndex(#[from] PeerIxExhausted),
+    #[error("cannot start the libp2p swarm: {0}")]
+    Swarm(Box<p2p::swarm::SwarmError>),
 }
 
 /// Why [`run`] stopped without a [`Control::Shutdown`]. The loop stops on the first
