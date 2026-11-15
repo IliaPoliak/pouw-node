@@ -974,6 +974,23 @@ async fn live_submit(app: &App, headers: &HeaderMap, body: &Bytes) -> Response {
     }
 }
 
+/// `POST /v1/txs` of a node whose loop listens on `api`: the status and the body of the
+/// answer. The seam of the tests that run the handler against the real loop.
+#[cfg(test)]
+pub(crate) async fn post_tx(api: mpsc::Sender<ApiRequest>, body: Bytes) -> (StatusCode, Vec<u8>) {
+    let app = App {
+        chain: None,
+        api,
+        pending: PendingTxs::default(),
+    };
+    let response = submit_tx(State(app), HeaderMap::new(), body).await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, body.to_vec())
+}
+
 // ------------------------------------------------------------------ servers
 
 fn api_router(app: App) -> Router {

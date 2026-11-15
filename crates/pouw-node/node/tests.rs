@@ -1963,3 +1963,54 @@ fn a_block_with_a_proof_is_served_with_its_derived_fields() {
     assert_eq!(proof.request_txid, pouw_types::txid(&proof_request(1, 0)));
     assert_eq!(view.id, block_id(&mined.header));
 }
+
+/// What `POST /v1/txs` answers for `tx` when the loop is the real one: the handler is a
+/// task of a runtime on this thread, and the loop handles each request it queues.
+fn post_to_node(h: &mut Harness, tx: &SignedTx) -> (axum::http::StatusCode, serde_json::Value) {
+    let runtime = runtime();
+    let body = axum::body::Bytes::from(borsh::to_vec(tx).unwrap());
+    let call = runtime.spawn(crate::http::post_tx(h.feeds.api.clone(), body));
+    while !call.is_finished() {
+        runtime.block_on(tokio::task::yield_now());
+        run(h);
+    }
+    let (status, body) = runtime.block_on(call).unwrap();
+    (status, serde_json::from_slice(&body).unwrap_or_default())
+}
+
+#[test]
+fn post_txs_runs_the_admission_check_against_the_state_of_the_node() {
+    let mut h = harness();
+    let genesis = with_genesis(&mut h);
+
+    // signed, on this chain, but more than the 1_000_000 of the sender
+    let broke = signed(
+        0,
+        TxKind::Transfer {
+            to: Address([2; 32]),
+            amount: Amount(2_000_000),
+        },
+    );
+    let (status, answer) = post_to_node(&mut h, &broke);
+    assert_eq!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(answer["error"]["code"], "insufficient_balance");
+    assert!(h.state.mempool.txs.is_empty());
+    assert_eq!(kinds(&h.state.events), ["tx_rejected"]);
+
+    // the same sender with a fair one is pooled
+    let fair = transfer(CHAIN, 0);
+    let (status, answer) = post_to_node(&mut h, &fair);
+    assert_eq!(status, axum::http::StatusCode::ACCEPTED);
+    assert_eq!(answer["txid"], serde_json::json!(txid(&fair)));
+    assert_eq!(h.state.mempool.txs.len(), 1);
+
+    // once a block holds it, its nonce is stale
+    deliver(&mut h, &block(&genesis, vec![fair.clone()]));
+    run(&mut h);
+    assert_eq!(tip_height(&h), Some(Height(1)));
+    assert!(h.state.mempool.txs.is_empty());
+    let (status, answer) = post_to_node(&mut h, &fair);
+    assert_eq!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(answer["error"]["code"], "bad_nonce");
+    assert!(h.state.mempool.txs.is_empty());
+}
