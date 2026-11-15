@@ -2,6 +2,11 @@
 # curl is there for the compose healthcheck. The node keeps its key and data in /data.
 FROM rust:1-slim-bookworm AS build
 WORKDIR /src
+# RocksDB is compiled from source: it needs a C++ compiler and libclang for its bindings
+# hadolint ignore=DL3008
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential clang libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
 COPY . .
 # The cache mounts keep crates and target/ between local builds, the binaries are
 # copied out because target/ is not part of the image

@@ -230,7 +230,7 @@ fn blocks_are_served_as_stored_in_the_order_asked() {
     assert_eq!(blocks.len(), 2);
     for (bytes, id) in blocks.iter().zip(&asked.ids) {
         let stored = store::block(&reader, id).unwrap().unwrap();
-        assert_eq!(bytes.as_slice(), stored.bytes);
+        assert_eq!(bytes.as_slice(), stored.bytes.as_ref());
     }
 }
 

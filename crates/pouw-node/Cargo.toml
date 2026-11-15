@@ -18,7 +18,7 @@ path = "pouw-node-main.rs"
 [features]
 default = ["rocksdb", "store-mem", "groth16"]
 groth16 = ["pouw-provers/groth16"]
-rocksdb = []
+rocksdb = ["dep:rocksdb"]
 store-mem = []
 
 [dependencies]
@@ -31,6 +31,7 @@ pouw-consensus.workspace = true
 pouw-crypto.workspace = true
 pouw-provers.workspace = true
 pouw-types.workspace = true
+rocksdb = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 signal-hook.workspace = true
