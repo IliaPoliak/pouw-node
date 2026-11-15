@@ -18,7 +18,6 @@ use pouw_crypto::Address;
 use pouw_types::{BlockId, TxId};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
-use tracing::warn;
 
 use crate::{
     chain::TxOutcome,
@@ -89,21 +88,17 @@ pub fn submit(api: &mpsc::Sender<ApiRequest>, request: ApiRequest) -> Result<(),
     }
 }
 
-/// The API server thread: turns HTTP calls on `addr` into [`ApiRequest`]s sent with
-/// [`submit`]. A submitted transaction is decoded and run through
-/// `precheck::check_tx` here, with a `pouw_consensus::Scratch` the thread keeps, and
-/// goes out as [`ApiRequest::SubmitTx`] with that verdict, valid or not, so the loop
-/// records a rejection. The axum server is pouw-node#59; until it exists the thread
-/// ends at once.
-///
-/// Routes are the constants of [`pouw_api::path`]: `TXS`, `TX`, `TX_INCLUSION_PROOF`, `HEAD`,
-/// `BLOCKS`, `BLOCK`, `BLOCK_HEADER`, `HEADERS`, `CIRCUITS`, `CIRCUIT`, `ACCOUNT`,
-/// `MEMPOOL`, `EVENTS`, `NODE`, `HEALTH` and `METRICS`. Bodies are `pouw_api::view`,
-/// errors `pouw_api::error::ErrorBody` with the status of its `ErrorClass`, and a full
-/// node queue answers 503 through [`submit`].
-pub fn serve(addr: SocketAddr, _api: &mpsc::Sender<ApiRequest>) -> Result<(), ComponentFault> {
-    warn!(%addr, "pouw-node#59: no REST API server, the address is not served");
-    Ok(())
+/// The API server thread: turns HTTP calls on `addr` into answers, see
+/// [`crate::http`]. With `fixtures` set it is the mock node of pouw-node#59 and answers
+/// the routes of [`pouw_api::path`] from the fixture chain. Without it only `/health`
+/// is served until the routes are wired to the node loop through `api` and [`submit`]
+/// (a full queue answers 503). The thread runs until the process ends.
+pub fn serve(
+    addr: SocketAddr,
+    fixtures: Option<&std::path::Path>,
+    api: &mpsc::Sender<ApiRequest>,
+) -> Result<(), ComponentFault> {
+    crate::http::serve_api(addr, fixtures, api)
 }
 
 pub fn tip(store: &Store) -> Result<Option<ChainTip>, StoreError> {
