@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use axum::{
     body::to_bytes,
     http::{HeaderValue, StatusCode},
@@ -359,6 +361,7 @@ fn an_expired_event_cursor_is_410_with_the_oldest_seq() {
     let query = Query(EventsQuery {
         after: Some(1),
         limit: None,
+        wait_ms: None,
     });
     let response = block_on(events(State(app), query));
     assert_eq!(response.status(), StatusCode::GONE);
@@ -566,4 +569,99 @@ fn live_circuits_are_listed_and_fetched_with_keys_only_when_asked() {
         include(false),
     ));
     assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+}
+
+fn block_event(seq: u64) -> Event {
+    Event {
+        seq,
+        time: EventTime::now(),
+        node_id: NodeId::default(),
+        kind: EventKind::BlockAccepted(BlockAccepted {
+            id: BlockId::ZERO,
+            height: Height(seq),
+            miner: Address([9; 32]),
+            tx_count: 0,
+            proof_count: 0,
+        }),
+    }
+}
+
+/// A node loop that answers `quiet` empty pages and then one event, and the count of its
+/// answers.
+fn event_loop(quiet: usize) -> (App, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
+    let app = live(move |request| {
+        let ApiRequest::Events { after, reply, .. } = request else {
+            panic!("unexpected request {request:?}");
+        };
+        let page = if seen.fetch_add(1, Ordering::SeqCst) < quiet {
+            EventsPage {
+                events: Vec::new(),
+                next: after,
+            }
+        } else {
+            let next = after.saturating_add(1);
+            EventsPage {
+                events: vec![block_event(next)],
+                next,
+            }
+        };
+        reply.send(Ok(page)).unwrap();
+    });
+    (app, calls)
+}
+
+fn poll(app: &App, after: u64, wait_ms: Option<u64>) -> (Value, Duration) {
+    let started = std::time::Instant::now();
+    let query = Query(EventsQuery {
+        after: Some(after),
+        limit: None,
+        wait_ms,
+    });
+    let response = block_on(events(State(app.clone()), query));
+    assert_eq!(response.status(), StatusCode::OK);
+    (json_of(response), started.elapsed())
+}
+
+#[test]
+fn wait_ms_is_none_by_default_and_never_over_thirty_seconds() {
+    assert_eq!(events_wait(None), Duration::ZERO);
+    assert_eq!(events_wait(Some(250)), Duration::from_millis(250));
+    assert_eq!(events_wait(Some(30_000)), Duration::from_secs(30));
+    assert_eq!(events_wait(Some(u64::MAX)), Duration::from_secs(30));
+}
+
+#[test]
+fn an_event_poll_without_wait_ms_answers_the_empty_page_at_once() {
+    let (app, calls) = event_loop(usize::MAX);
+    let (json, took) = poll(&app, 4, None);
+    assert_eq!(json["events"], json!([]));
+    assert_eq!(json["next"], json!(4));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(took < Duration::from_millis(150), "answered after {took:?}");
+}
+
+#[test]
+fn an_event_poll_is_held_until_there_is_news() {
+    let (app, calls) = event_loop(2);
+    let (json, took) = poll(&app, 0, Some(5_000));
+    assert_eq!(json["events"].as_array().unwrap().len(), 1);
+    assert_eq!(json["next"], json!(1));
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert!(took < Duration::from_secs(3), "waited {took:?}");
+}
+
+#[test]
+fn an_event_poll_that_finds_nothing_ends_with_the_empty_page_after_wait_ms() {
+    let (app, calls) = event_loop(usize::MAX);
+    let (json, took) = poll(&app, 4, Some(400));
+    assert_eq!(json["events"], json!([]));
+    assert_eq!(json["next"], json!(4));
+    assert!(
+        took >= Duration::from_millis(400),
+        "answered after {took:?}"
+    );
+    assert!(took < Duration::from_secs(3), "waited {took:?}");
+    assert!(calls.load(Ordering::SeqCst) >= 2);
 }
