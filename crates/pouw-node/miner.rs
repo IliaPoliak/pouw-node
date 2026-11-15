@@ -140,6 +140,8 @@ pub struct NonceDone {
     pub found: Option<PowNonce>,
     /// Where the next range starts. `u64::MAX` means the nonces are used up.
     pub next_start: u64,
+    /// Nonces tried in the range: up to and including the found one, else all.
+    pub attempts: u64,
 }
 
 /// A block back from [`WorkJob::VerifyWork`].
@@ -298,6 +300,7 @@ pub fn search_nonce(job: &SearchJob) -> NonceDone {
                 key: job.key,
                 found: Some(PowNonce(nonce)),
                 next_start: end,
+                attempts: nonce.saturating_sub(job.start).saturating_add(1),
             };
         }
     }
@@ -305,6 +308,7 @@ pub fn search_nonce(job: &SearchJob) -> NonceDone {
         key: job.key,
         found: None,
         next_start: end,
+        attempts: end.saturating_sub(job.start),
     }
 }
 
@@ -831,6 +835,7 @@ fn build_template(
 /// `chain::receive_block`, and its header is announced to the peers.
 pub fn on_nonce(state: &mut NodeState, done: NonceDone) -> Result<(), NodeFault> {
     state.work.in_flight = None;
+    state.metrics.lottery_attempts = state.metrics.lottery_attempts.saturating_add(done.attempts);
     let current = state
         .work
         .template

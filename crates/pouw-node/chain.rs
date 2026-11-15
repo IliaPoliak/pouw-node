@@ -270,12 +270,30 @@ pub fn receive_block(
     if extends_tip {
         return Ok(
             match connect_stored(store, mempool, log, params, block, &checked.txids, &id)? {
-                Connect::Connected(tip) => BlockOutcome::Connected(tip),
+                Connect::Connected(tip) => {
+                    record_block(store, metrics, block)?;
+                    BlockOutcome::Connected(tip)
+                }
                 Connect::Rejected(invalid) => BlockOutcome::Invalid(invalid),
             },
         );
     }
     side_branch(store, mempool, log, params, &id)
+}
+
+/// Counts a block that extended the tip: the block, its proofs and the seconds since its
+/// parent. A block connected by a reorganization is not counted.
+fn record_block(store: &Store, metrics: &mut Metrics, block: &Block) -> Result<(), ChainFault> {
+    let reader = store::read(store)?;
+    let parent = store::header(&reader, &block.header.parent)?.map(|h| h.timestamp.get());
+    let secs = parent.map_or(0, |parent| {
+        block.header.timestamp.get().saturating_sub(parent)
+    });
+    metrics.blocks_connected = metrics.blocks_connected.saturating_add(1);
+    metrics.block_time_secs = metrics.block_time_secs.saturating_add(secs);
+    let proofs = u64::try_from(block.proof_txs.len()).unwrap_or(u64::MAX);
+    metrics.block_proofs = metrics.block_proofs.saturating_add(proofs);
+    Ok(())
 }
 
 fn emit_rejected(
