@@ -20,8 +20,8 @@
 //!   the store, the mempool and the event log: node, head, block, header, blocks,
 //!   headers, account, transaction, inclusion proof, circuits, circuit, mempool, events
 //!   and `POST /v1/txs`. A transaction is served from the canonical chain, else from the
-//!   mempool as `pending`; its inclusion proof only once it is in a block. `wait_ms` of
-//!   the events is not served yet (pouw-node#82).
+//!   mempool as `pending`; its inclusion proof only once it is in a block. `GET /v1/events`
+//!   holds a request up to `wait_ms` (at most 30 s) while nothing is new.
 //!
 //! `/metrics` always asks the node loop, whatever the mode.
 
@@ -86,6 +86,12 @@ const METRICS_WAIT: Duration = Duration::from_secs(5);
 
 /// How long a route waits for the node loop.
 const ASK_WAIT: Duration = Duration::from_secs(5);
+
+/// The longest `wait_ms` of `GET /v1/events` holds a request (`node-events.md`).
+const MAX_EVENTS_WAIT: Duration = Duration::from_secs(30);
+
+/// How often a held `GET /v1/events` asks the node loop for news.
+const EVENTS_POLL: Duration = Duration::from_millis(200);
 
 /// Most transactions the mock keeps as pending, a submission over it answers 503.
 const MAX_PENDING: usize = 4096;
@@ -242,6 +248,7 @@ struct Range {
 struct EventsQuery {
     after: Option<u64>,
     limit: Option<u32>,
+    wait_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -933,20 +940,40 @@ fn cursor_expired(expired: CursorExpired) -> Response {
     (StatusCode::GONE, Json(body)).into_response()
 }
 
-/// A page of the event log. There is no long poll yet: the answer is immediate.
+/// How long `wait_ms` holds a request: none when absent, at most [`MAX_EVENTS_WAIT`].
+fn events_wait(wait_ms: Option<u64>) -> Duration {
+    Duration::from_millis(wait_ms.unwrap_or(0)).min(MAX_EVENTS_WAIT)
+}
+
+/// A page of the event log. A request that finds nothing new is held until there is news
+/// or `wait_ms` is over, and asks the node loop again every [`EVENTS_POLL`]. The wait ends
+/// with the empty page, whose `next` is `after`. A cursor that expires while waiting is
+/// answered at once.
 async fn live_events(app: &App, query: &EventsQuery) -> Response {
     let after = query.after.unwrap_or(0);
     let limit = query.limit.unwrap_or(100).clamp(1, 1000);
-    match ask(app, |reply| ApiRequest::Events {
-        after,
-        limit,
-        reply,
-    })
-    .await
-    {
-        Ok(Ok(page)) => Json(page).into_response(),
-        Ok(Err(expired)) => cursor_expired(expired),
-        Err(response) => response,
+    let started = tokio::time::Instant::now();
+    let deadline = started
+        .checked_add(events_wait(query.wait_ms))
+        .unwrap_or(started);
+    loop {
+        let asked = ask(app, |reply| ApiRequest::Events {
+            after,
+            limit,
+            reply,
+        })
+        .await;
+        match asked {
+            Ok(Ok(page)) => {
+                let now = tokio::time::Instant::now();
+                if !page.events.is_empty() || now >= deadline {
+                    return Json(page).into_response();
+                }
+                tokio::time::sleep(EVENTS_POLL.min(deadline.saturating_duration_since(now))).await;
+            }
+            Ok(Err(expired)) => return cursor_expired(expired),
+            Err(response) => return response,
+        }
     }
 }
 
