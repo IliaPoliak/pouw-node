@@ -2128,3 +2128,61 @@ fn a_tx_its_inclusion_proof_and_the_circuits_are_served_from_the_store() {
     .unwrap();
     assert_eq!(missing, None);
 }
+
+#[cfg(feature = "rocksdb")]
+#[test]
+fn the_circuits_of_a_rocksdb_store_are_listed_by_registration_and_survive_a_restart() {
+    let dir = std::env::temp_dir().join(format!("pouw-node-{}-circuits", std::process::id()));
+    drop(std::fs::remove_dir_all(&dir));
+    let open = || store::open(crate::config::StoreKind::Rocksdb, &dir).unwrap();
+    let listed = |store: &store::Store| {
+        store::circuits(&store::read(store).unwrap())
+            .unwrap()
+            .iter()
+            .map(|entry| (entry.id, entry.registered_at))
+            .collect::<Vec<_>>()
+    };
+
+    let mut h = harness();
+    h.state.store = open();
+    let genesis = with_circuit(&mut h);
+    // a second circuit, registered one block later, with an id that sorts before the first
+    let [first] = store::circuits(&store::read(&h.state.store).unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap_or_else(|_| panic!("one circuit is registered"));
+    let second = CircuitEntry {
+        id: CircuitId(TxId(Hash32([2; 32]))),
+        registered_at: Height(1),
+        ..first.clone()
+    };
+    let child = block(&genesis, vec![]);
+    let child_id = put(&mut h.state.store, &child);
+    let mut diff = StateDiff::default();
+    diff.circuits.insert(
+        second.id,
+        Change {
+            before: None,
+            after: Some(second.clone()),
+        },
+    );
+    store::connect_block(&mut h.state.store, &child_id, &[], &diff).unwrap();
+
+    // the API lists them, by height of registration and not by id
+    let expected = [(first.id, Height(0)), (second.id, Height(1))];
+    let ids = |h: &mut Harness, keys: bool| {
+        ask_api(h, |reply| ApiRequest::Circuits { keys, reply })
+            .unwrap()
+            .iter()
+            .map(|view| (view.id, view.registered_at))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&mut h, false), expected);
+    let keyed = ask_api(&mut h, |reply| ApiRequest::Circuits { keys: true, reply }).unwrap();
+    assert_eq!(keyed[0].circuit.as_deref(), Some(CIRCUIT));
+
+    // the registry is read back from the files
+    h.state.store = store::memory();
+    let reopened = open();
+    assert_eq!(listed(&reopened), expected);
+}

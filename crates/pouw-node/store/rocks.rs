@@ -293,8 +293,13 @@ pub fn circuit<'v>(view: &'v Db, id: &CircuitId) -> Result<Option<&'v CircuitEnt
     Ok(view.circuits.get(id))
 }
 
+/// Every registered circuit, ascending by height of registration and then by id, as in
+/// the in-memory backend. The table is the one kept in memory, read when the store is
+/// opened and updated by every connect and disconnect.
 pub fn circuits(view: &Db) -> Result<Vec<CircuitEntry>, StoreError> {
-    match *view {}
+    let mut entries: Vec<CircuitEntry> = view.circuits.values().cloned().collect();
+    entries.sort_by_key(|entry| (entry.registered_at, entry.id));
+    Ok(entries)
 }
 
 pub fn usage_counter(
