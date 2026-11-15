@@ -35,7 +35,7 @@ use std::{
 
 use pouw_api::{event::MempoolSnapshot, view::MempoolView};
 use pouw_crypto::Address;
-use pouw_types::{Amount, CircuitId, FastMap, Nonce, SignedTx, TxId, TxKind, encoded_len};
+use pouw_types::{Amount, CircuitId, FastMap, Nonce, SignedTx, TxBody, TxId, TxKind, encoded_len};
 use thiserror::Error;
 
 /// Most bytes of `verifying_key` and `circuit` together that the node relays and
@@ -297,6 +297,54 @@ pub fn remove_through(pool: &mut Mempool, sender: &Address, nonce: Nonce) -> usi
     stale.iter().filter(|id| remove(pool, id).is_some()).count()
 }
 
+/// The bodies of the pending transactions of `sender` with a nonce below `nonce`, in
+/// nonce order. They take their cost from the balance before a transaction with
+/// `nonce` does, see `pouw_consensus::check_admission`.
+pub fn queued_before<'p>(pool: &'p Mempool, sender: &Address, nonce: Nonce) -> Vec<&'p TxBody> {
+    let Some(queue) = pool.senders.get(sender) else {
+        return Vec::new();
+    };
+    queue
+        .range(..nonce)
+        .filter_map(|(_, id)| pool.txs.get(id))
+        .map(|pending| &pending.tx.body)
+        .collect()
+}
+
+/// Removes the pending transactions of `sender` that its balance cannot pay, and
+/// returns their ids. The queue is walked in nonce order from `nonce`, the nonce of
+/// the account at the tip, adding up the cost of each transaction as `apply_block`
+/// takes it from the balance. A transaction that does not fit is removed and adds
+/// nothing. Called after an insert, because a transaction with a lower nonce takes its
+/// cost from the balance before the ones with a higher nonce, which admission, that
+/// sees only the lower nonces, cannot check (pouw-node#116).
+pub fn drop_unaffordable(
+    pool: &mut Mempool,
+    sender: &Address,
+    nonce: Nonce,
+    balance: Amount,
+) -> Vec<TxId> {
+    let queue: Vec<TxId> = pool.senders.get(sender).map_or_else(Vec::new, |queue| {
+        queue.range(nonce..).map(|(_, id)| *id).collect()
+    });
+    let mut spent = Amount(0);
+    let mut dropped = Vec::new();
+    for id in queue {
+        let fits = pool
+            .txs
+            .get(&id)
+            .and_then(|pending| pouw_consensus::admission::cost(&pending.tx.body))
+            .and_then(|each| spent.checked_add(each))
+            .filter(|total| *total <= balance);
+        match fits {
+            Some(total) => spent = total,
+            None => dropped.push(id),
+        }
+    }
+    dropped.retain(|id| remove(pool, id).is_some());
+    dropped
+}
+
 pub fn get<'p>(pool: &'p Mempool, id: &TxId) -> Option<&'p SignedTx> {
     pool.txs.get(id).map(|pending| &pending.tx)
 }
@@ -407,6 +455,64 @@ mod tests {
                 amount: Amount(1),
             },
         )
+    }
+
+    fn paying(nonce: u64, amount: u64) -> SignedTx {
+        tx(
+            nonce,
+            TxKind::Transfer {
+                to: Address([2; 32]),
+                amount: Amount(amount),
+            },
+        )
+    }
+
+    fn sender() -> Address {
+        SigningKey::from_seed([1; 32]).address()
+    }
+
+    #[test]
+    fn a_later_nonce_the_balance_no_longer_covers_is_dropped() {
+        // Balance 100, each transfer costs 69 plus the fee 1. The nonce 1 is pooled
+        // first, then the nonce 0, which takes its cost first.
+        let mut pool = empty(LIMITS);
+        let late = add(&mut pool, paying(1, 69)).unwrap();
+        let early = add(&mut pool, paying(0, 69)).unwrap();
+        let dropped = drop_unaffordable(&mut pool, &sender(), Nonce(0), Amount(100));
+        assert_eq!(dropped, [late]);
+        assert!(get(&pool, &early).is_some());
+        assert!(get(&pool, &late).is_none());
+        assert_consistent(&pool);
+    }
+
+    #[test]
+    fn what_the_balance_covers_stays_pooled() {
+        let mut pool = empty(LIMITS);
+        add(&mut pool, paying(0, 9)).unwrap();
+        add(&mut pool, paying(1, 9)).unwrap();
+        add(&mut pool, paying(7, 9)).unwrap();
+        // 3 x 10 = 30, a gap does not change what the balance must cover.
+        assert_eq!(
+            drop_unaffordable(&mut pool, &sender(), Nonce(0), Amount(30)),
+            []
+        );
+        assert_eq!(pool.txs.len(), 3);
+        let dropped = drop_unaffordable(&mut pool, &sender(), Nonce(0), Amount(29));
+        assert_eq!(dropped.len(), 1);
+        assert_consistent(&pool);
+    }
+
+    #[test]
+    fn a_stale_nonce_is_not_counted() {
+        let mut pool = empty(LIMITS);
+        add(&mut pool, paying(0, 99)).unwrap();
+        let next = add(&mut pool, paying(1, 9)).unwrap();
+        // The account is at nonce 1 already, the nonce 0 is stale and costs nothing.
+        assert_eq!(
+            drop_unaffordable(&mut pool, &sender(), Nonce(1), Amount(10)),
+            []
+        );
+        assert!(get(&pool, &next).is_some());
     }
 
     #[test]
