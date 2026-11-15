@@ -3,14 +3,20 @@
 //!
 //! Answered from the header store: `GET /v1/light/head`,
 //! `GET /v1/blocks/{height_or_hash}/header` and `GET /v1/headers?from=&to=`, and
-//! `GET /health`. A header is borsh by default and the JSON view when `Accept` names
+//! `GET /health`. Asked of a full node (`POUW_FULL_NODES`) and passed on: the block,
+//! `GET /v1/accounts/{addr}`, `GET /v1/txs/{txid}` and its `/inclusion-proof`.
+//! `GET /v1/light/proof-jobs/{txid}` is built from the tx of a full node and the
+//! headers of the store. A header is borsh by default and the JSON view when `Accept` names
 //! `application/json`, as in the full node API.
 //!
 //! A header is found by its height or by its `blk:` id at any depth, the store keeps
 //! an index of the ids.
 //!
 //! Errors have the shape `{"error": {"code", "message"}}` with the codes of the light
-//! contract: `bad_request` (400), `unknown_block` (404), `range_too_large` (422).
+//! contract: `bad_request` (400), `unknown_block`, `unknown_account`, `unknown_tx` and
+//! `unknown_proof_job` (404), `range_too_large` (422). A full node that cannot be reached
+//! is 502 `upstream_unavailable`. An id is checked before any full node is asked, so a
+//! request never carries text of the client into the path.
 
 use std::{
     io::{self, BufRead, BufReader, Read, Write},
@@ -23,18 +29,25 @@ use std::{
 use pouw_api::{
     error::{ErrorBody, code},
     path::{HEADERS, HEALTH},
-    view::{HeaderView, HeadersPage, MAX_HEADERS_PER_CALL},
+    view::{HeaderView, HeadersPage, MAX_HEADERS_PER_CALL, TxStatus, TxView},
 };
-use pouw_types::{BlockHeader, BlockId, ChainId, Height};
-use serde::Serialize;
+use pouw_crypto::Address;
+use pouw_types::{BlockHeader, BlockId, ChainId, Height, ProofHash, TxId, TxKind, block_id};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use crate::headers::{HeaderStore, StoreError};
+use crate::{
+    headers::{HeaderStore, StoreError},
+    upstream::{Answer, Upstream},
+};
 
 const LIGHT_HEAD: &str = "/v1/light/head";
 const BAD_REQUEST: &str = "bad_request";
 const UNKNOWN_BLOCK: &str = "unknown_block";
+const UNKNOWN_ACCOUNT: &str = "unknown_account";
+const UNKNOWN_TX: &str = "unknown_tx";
+const UNKNOWN_PROOF_JOB: &str = "unknown_proof_job";
 
 const JSON: &str = "application/json";
 const OCTETS: &str = "application/octet-stream";
@@ -43,17 +56,19 @@ const OCTETS: &str = "application/octet-stream";
 const MAX_HEAD_BYTES: u64 = 8192;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// What the light node serves: the header store behind a lock. The sync writes through
-/// [`LightApi::store`], the routes read.
+/// What the light node serves: the header store behind a lock and the full nodes it asks
+/// for the rest. The sync writes through [`LightApi::store`], the routes read.
 #[derive(Debug)]
 pub struct LightApi {
     store: RwLock<HeaderStore>,
+    upstream: Upstream,
 }
 
 impl LightApi {
-    pub fn new(store: HeaderStore) -> Self {
+    pub fn new(store: HeaderStore, upstream: Upstream) -> Self {
         Self {
             store: RwLock::new(store),
+            upstream,
         }
     }
 
@@ -125,6 +140,14 @@ impl Reply {
         Self::error("404 Not Found", code, message)
     }
 
+    fn bad_gateway() -> Self {
+        Self::error(
+            "502 Bad Gateway",
+            "upstream_unavailable",
+            "no full node answered",
+        )
+    }
+
     fn internal() -> Self {
         Self::error(
             "500 Internal Server Error",
@@ -159,6 +182,163 @@ fn block_key(text: &str) -> Option<Key> {
     serde_json::from_value::<BlockId>(Value::String(text.to_owned()))
         .ok()
         .map(Key::Id)
+}
+
+/// `text` as a `T` and back as text, so that only the canonical form of an id reaches a
+/// full node.
+fn typed<T: Serialize + DeserializeOwned>(text: &str) -> Option<String> {
+    let value: T = serde_json::from_value(Value::String(text.to_owned())).ok()?;
+    serde_json::to_value(&value)
+        .ok()?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// What a full node answered, as the light node answers it: a 200 as it is, a 404 with
+/// the code `missing` of the route, a 400 as `bad_request`, anything else is 502.
+fn forwarded(answer: Answer, missing: &str) -> Reply {
+    match answer.status {
+        200 => Reply {
+            status: "200 OK",
+            content_type: if answer.content_type.contains(JSON) {
+                JSON
+            } else {
+                OCTETS
+            },
+            body: answer.body,
+        },
+        404 => Reply::not_found(missing, "not known to the full node"),
+        400 => Reply::bad_request("the full node does not accept the request"),
+        status => {
+            warn!(status, "unexpected answer of a full node");
+            Reply::bad_gateway()
+        }
+    }
+}
+
+fn forward(api: &LightApi, path: &str, json: bool, missing: &str) -> Reply {
+    match api.upstream.get(path, json) {
+        Ok(answer) => forwarded(answer, missing),
+        Err(error) => {
+            warn!(%error, path, "cannot ask a full node");
+            Reply::bad_gateway()
+        }
+    }
+}
+
+/// `GET /v1/blocks/{height_or_hash}`.
+fn block(api: &LightApi, key: &str, json: bool) -> Reply {
+    let path = match block_key(key) {
+        None => return Reply::bad_request("not a height or a blk: id"),
+        Some(Key::Height(height)) => format!("/v1/blocks/{}", height.0),
+        Some(Key::Id(id)) => format!("/v1/blocks/{id}"),
+    };
+    forward(api, &path, json, UNKNOWN_BLOCK)
+}
+
+/// `GET /v1/accounts/{addr}`.
+fn account(api: &LightApi, addr: &str, json: bool) -> Reply {
+    match typed::<Address>(addr) {
+        Some(addr) => forward(api, &format!("/v1/accounts/{addr}"), json, UNKNOWN_ACCOUNT),
+        None => Reply::bad_request("not an address"),
+    }
+}
+
+/// `GET /v1/txs/{txid}` and, with `suffix`, `/inclusion-proof`.
+fn tx(api: &LightApi, txid: &str, suffix: &str, json: bool) -> Reply {
+    match typed::<TxId>(txid) {
+        Some(txid) => forward(api, &format!("/v1/txs/{txid}{suffix}"), json, UNKNOWN_TX),
+        None => Reply::bad_request("not a tx: id"),
+    }
+}
+
+/// `GET /v1/light/proof-jobs/{txid}`, the status of a proof request. It is read from the
+/// tx view of a full node; the block of an included request is the header of that
+/// height among the headers the light node holds.
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum ProofJob {
+    Pending {
+        txid: TxId,
+    },
+    Included {
+        txid: TxId,
+        proof_hash: ProofHash,
+        height: Height,
+        block: BlockId,
+    },
+}
+
+fn proof_job(api: &LightApi, txid: &str) -> Reply {
+    let Some(txid) = typed::<TxId>(txid) else {
+        return Reply::bad_request("not a tx: id");
+    };
+    let answer = match api.upstream.get(&format!("/v1/txs/{txid}"), true) {
+        Ok(answer) => answer,
+        Err(error) => {
+            warn!(%error, "cannot ask a full node");
+            return Reply::bad_gateway();
+        }
+    };
+    if answer.status != 200 {
+        return forwarded(answer, UNKNOWN_PROOF_JOB);
+    }
+    let Ok(view) = serde_json::from_slice::<TxView>(&answer.body) else {
+        warn!("a full node answered a tx that does not parse");
+        return Reply::bad_gateway();
+    };
+    if !matches!(view.tx.tx.body.kind, TxKind::ProofRequest { .. }) {
+        return Reply::not_found(UNKNOWN_PROOF_JOB, "not a proof request");
+    }
+    let job = match (view.status, view.height, view.proof) {
+        (TxStatus::Pending, _, _) => ProofJob::Pending { txid: view.txid },
+        (TxStatus::Included, Some(height), Some(proof)) => {
+            let block = match api.read(|store| store.get(height)) {
+                Ok(Some(header)) => block_id(&header),
+                Ok(None) => {
+                    return Reply::not_found(
+                        UNKNOWN_BLOCK,
+                        "the light node does not hold the block of this proof yet",
+                    );
+                }
+                Err(reply) => return reply,
+            };
+            ProofJob::Included {
+                txid: view.txid,
+                proof_hash: proof.proof_hash,
+                height,
+                block,
+            }
+        }
+        (TxStatus::Included, _, _) => {
+            warn!("a full node answered an included proof request without its proof");
+            return Reply::bad_gateway();
+        }
+    };
+    Reply::json(&job)
+}
+
+/// The routes with an id in the path.
+fn with_id(api: &LightApi, path: &str, json: bool) -> Reply {
+    if let Some(rest) = path.strip_prefix("/v1/blocks/") {
+        return match rest.strip_suffix("/header") {
+            Some(key) => header(api, key, json),
+            None => block(api, rest, json),
+        };
+    }
+    if let Some(addr) = path.strip_prefix("/v1/accounts/") {
+        return account(api, addr, json);
+    }
+    if let Some(rest) = path.strip_prefix("/v1/txs/") {
+        return match rest.strip_suffix("/inclusion-proof") {
+            Some(txid) => tx(api, txid, "/inclusion-proof", json),
+            None => tx(api, rest, "", json),
+        };
+    }
+    if let Some(txid) = path.strip_prefix("/v1/light/proof-jobs/") {
+        return proof_job(api, txid);
+    }
+    Reply::not_found(code::NOT_FOUND, "no such route")
 }
 
 fn head(api: &LightApi) -> Reply {
@@ -277,13 +457,7 @@ fn route(api: &LightApi, request_line: &str, json: bool) -> Reply {
         },
         LIGHT_HEAD => head(api),
         HEADERS => headers(api, query),
-        other => match other
-            .strip_prefix("/v1/blocks/")
-            .and_then(|rest| rest.strip_suffix("/header"))
-        {
-            Some(key) => header(api, key, json),
-            None => Reply::not_found(code::NOT_FOUND, "no such route"),
-        },
+        other => with_id(api, other, json),
     }
 }
 

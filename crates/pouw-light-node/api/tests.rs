@@ -7,13 +7,22 @@ use std::{
     thread,
 };
 
-use pouw_api::view::HeaderView;
-use pouw_crypto::{Address, Hash32};
-use pouw_types::{BlockHeader, BlockId, Target, U32, U64, block_id};
+use pouw_api::view::{HeaderView, IncludedProof, SignedTxView, TxStatus, TxView};
+use pouw_crypto::{Address, FieldInput, Hash32, Signature};
+use pouw_types::{
+    Amount, BlockHeader, BlockId, ChainId, CircuitId, Height, Nonce, ProofHash, ProofSystem,
+    SignedTx, Target, TxBody, TxId, TxKind, U32, U64, UsageCounter, block_id,
+};
 use serde_json::{Value, json};
 
 use super::{LightApi, respond, serve};
-use crate::headers::HeaderStore;
+use crate::{
+    headers::HeaderStore,
+    upstream::{
+        Upstream,
+        tests::{dead_node, fake_node, http},
+    },
+};
 
 fn header(height: u64, parent: BlockId) -> BlockHeader {
     BlockHeader {
@@ -54,7 +63,7 @@ fn api_with(name: &str, count: u64, cache: usize) -> (LightApi, Vec<BlockHeader>
     for next in &headers {
         store.push(*next).unwrap();
     }
-    (LightApi::new(store), headers)
+    (LightApi::new(store, Upstream::default()), headers)
 }
 
 /// The status code and the body of the answer to `GET target`.
@@ -93,7 +102,10 @@ fn the_head_is_the_tip_with_its_chain_id() {
 
 #[test]
 fn a_light_node_without_headers_has_no_head() {
-    let api = LightApi::new(HeaderStore::open(&path("nohead"), 4).unwrap());
+    let api = LightApi::new(
+        HeaderStore::open(&path("nohead"), 4).unwrap(),
+        Upstream::default(),
+    );
     let (status, body) = call(&api, "/v1/light/head", false);
     assert_eq!(status, 404);
     assert_eq!(error_code(&body), json!("unknown_block"));
@@ -228,4 +240,274 @@ fn the_server_answers_over_a_socket_and_reads_the_accept_header() {
     assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
     assert!(answer.contains("application/json"), "{answer}");
     assert!(answer.contains(r#""id":"blk:"#), "{answer}");
+}
+
+fn text<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+fn request() -> SignedTx {
+    SignedTx {
+        body: TxBody {
+            chain_id: ChainId(7),
+            sender: Address([0x11; 32]),
+            nonce: Nonce(4),
+            fee: Amount(120),
+            kind: TxKind::ProofRequest {
+                circuit: CircuitId(TxId(Hash32([0x22; 32]))),
+                public_inputs: vec![FieldInput([3; 31])],
+                witness: Box::from([1, 2, 3]),
+            },
+        },
+        signature: Signature([9; 64]),
+    }
+}
+
+fn transfer() -> SignedTx {
+    SignedTx {
+        body: TxBody {
+            chain_id: ChainId(7),
+            sender: Address([0x11; 32]),
+            nonce: Nonce(5),
+            fee: Amount(1),
+            kind: TxKind::Transfer {
+                to: Address([0x33; 32]),
+                amount: Amount(10),
+            },
+        },
+        signature: Signature([9; 64]),
+    }
+}
+
+/// The JSON of `GET /v1/txs/{txid}` for `tx`, included at `height` or pending.
+fn tx_view(tx: &SignedTx, height: Option<u64>) -> Vec<u8> {
+    let signed = SignedTxView::from(tx);
+    let view = match height {
+        None => TxView {
+            txid: signed.txid,
+            status: TxStatus::Pending,
+            tx: signed,
+            height: None,
+            index: None,
+            proof: None,
+        },
+        Some(height) => TxView {
+            txid: signed.txid,
+            status: TxStatus::Included,
+            tx: signed,
+            height: Some(Height(height)),
+            index: Some(0),
+            proof: Some(IncludedProof {
+                eta: FieldInput([1; 31]),
+                mask: FieldInput([2; 31]),
+                proof_system: ProofSystem::PlonkKzg,
+                usage_counter: UsageCounter(1),
+                proof: Box::from([4, 5]),
+                proof_hash: ProofHash(Hash32([5; 32])),
+            }),
+        },
+    };
+    serde_json::to_vec(&view).unwrap()
+}
+
+/// An API over `count` headers whose full node is the one at `url`.
+fn api_asking(name: &str, count: u64, url: &str) -> (LightApi, Vec<BlockHeader>) {
+    let (mut api, headers) = api_with(name, count, 8);
+    api.upstream = Upstream::new(&[url.to_owned()]);
+    (api, headers)
+}
+
+#[test]
+fn a_block_an_account_a_tx_and_an_inclusion_proof_are_asked_of_the_full_node() {
+    let account = text(&Address([0x11; 32]));
+    let txid = text(&SignedTxView::from(&request()).txid);
+    let answers = vec![
+        http("200 OK", "application/json", br#"{"block":1}"#),
+        http("200 OK", "application/json", br#"{"account":1}"#),
+        http("200 OK", "application/json", br#"{"tx":1}"#),
+        http("200 OK", "application/json", br#"{"proof":1}"#),
+    ];
+    let (url, node) = fake_node(answers);
+    let (api, _) = api_asking("forward", 2, &url);
+
+    let (status, body) = call(&api, "/v1/blocks/3", true);
+    assert_eq!((status, json_of(&body)), (200, json!({"block": 1})));
+    let (status, body) = call(&api, &format!("/v1/accounts/{account}"), true);
+    assert_eq!((status, json_of(&body)), (200, json!({"account": 1})));
+    let (status, body) = call(&api, &format!("/v1/txs/{txid}"), true);
+    assert_eq!((status, json_of(&body)), (200, json!({"tx": 1})));
+    let (status, body) = call(&api, &format!("/v1/txs/{txid}/inclusion-proof"), true);
+    assert_eq!((status, json_of(&body)), (200, json!({"proof": 1})));
+
+    let requests = node.join().unwrap();
+    let lines: Vec<&str> = requests
+        .iter()
+        .map(|request| request.lines().next().unwrap())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "GET /v1/blocks/3 HTTP/1.0".to_owned(),
+            format!("GET /v1/accounts/{account} HTTP/1.0"),
+            format!("GET /v1/txs/{txid} HTTP/1.0"),
+            format!("GET /v1/txs/{txid}/inclusion-proof HTTP/1.0"),
+        ]
+    );
+}
+
+#[test]
+fn a_block_is_asked_of_the_full_node_by_id_and_borsh_passes_through() {
+    let (url, node) = fake_node(vec![http("200 OK", "application/octet-stream", &[7, 8, 9])]);
+    let (api, headers) = api_asking("blockid", 2, &url);
+    let id = text(&block_id(&headers[1]));
+    let (status, body) = call(&api, &format!("/v1/blocks/{id}"), false);
+    assert_eq!((status, body), (200, vec![7, 8, 9]));
+    let requests = node.join().unwrap();
+    assert!(requests[0].starts_with(&format!("GET /v1/blocks/{id} HTTP/1.0")));
+    assert!(requests[0].contains("accept: application/octet-stream"));
+}
+
+#[test]
+fn a_404_of_the_full_node_becomes_the_code_of_the_route() {
+    let missing = || {
+        http(
+            "404 Not Found",
+            "application/json",
+            br#"{"error":{"code":"not_found","message":"x"}}"#,
+        )
+    };
+    let (url, node) = fake_node(vec![missing(), missing(), missing(), missing()]);
+    let (api, _) = api_asking("missing", 2, &url);
+    let account = text(&Address([0x11; 32]));
+    let txid = text(&SignedTxView::from(&request()).txid);
+
+    let (status, body) = call(&api, "/v1/blocks/9", true);
+    assert_eq!((status, error_code(&body)), (404, json!("unknown_block")));
+    let (status, body) = call(&api, &format!("/v1/accounts/{account}"), true);
+    assert_eq!((status, error_code(&body)), (404, json!("unknown_account")));
+    let (status, body) = call(&api, &format!("/v1/txs/{txid}"), true);
+    assert_eq!((status, error_code(&body)), (404, json!("unknown_tx")));
+    let (status, body) = call(&api, &format!("/v1/txs/{txid}/inclusion-proof"), true);
+    assert_eq!((status, error_code(&body)), (404, json!("unknown_tx")));
+    node.join().unwrap();
+}
+
+#[test]
+fn a_malformed_id_is_400_before_the_full_node_is_asked() {
+    let (api, _) = api_with("malformed", 2, 8);
+    for target in [
+        "/v1/blocks/zzz",
+        "/v1/accounts/zzz",
+        "/v1/txs/zzz",
+        "/v1/txs/zzz/inclusion-proof",
+        "/v1/light/proof-jobs/zzz",
+        "/v1/txs/../accounts/x",
+    ] {
+        let (status, body) = call(&api, target, true);
+        assert_eq!(status, 400, "{target}");
+        assert_eq!(error_code(&body), json!("bad_request"), "{target}");
+    }
+}
+
+#[test]
+fn without_a_full_node_the_forwarded_routes_are_502_and_the_header_routes_still_work() {
+    let (api, _) = api_with("nofull", 3, 8);
+    let account = text(&Address([0x11; 32]));
+    for target in ["/v1/blocks/1".to_owned(), format!("/v1/accounts/{account}")] {
+        let (status, body) = call(&api, &target, true);
+        assert_eq!(status, 502, "{target}");
+        assert_eq!(error_code(&body), json!("upstream_unavailable"));
+    }
+    let (status, _) = call(&api, "/v1/blocks/1/header", true);
+    assert_eq!(status, 200);
+    let (status, _) = call(&api, "/v1/light/head", true);
+    assert_eq!(status, 200);
+}
+
+#[test]
+fn a_dead_full_node_is_skipped_for_the_next_one() {
+    let (live, node) = fake_node(vec![http("200 OK", "application/json", br#"{"ok":1}"#)]);
+    let (mut api, _) = api_with("fallback", 2, 8);
+    api.upstream = Upstream::new(&[dead_node(), live]);
+    let (status, body) = call(&api, "/v1/blocks/1", true);
+    assert_eq!((status, json_of(&body)), (200, json!({"ok": 1})));
+    node.join().unwrap();
+}
+
+#[test]
+fn a_pending_proof_request_is_a_pending_proof_job() {
+    let tx = request();
+    let txid = text(&SignedTxView::from(&tx).txid);
+    let (url, node) = fake_node(vec![http(
+        "200 OK",
+        "application/json",
+        &tx_view(&tx, None),
+    )]);
+    let (api, _) = api_asking("jobpending", 2, &url);
+    let (status, body) = call(&api, &format!("/v1/light/proof-jobs/{txid}"), true);
+    assert_eq!(status, 200);
+    assert_eq!(json_of(&body), json!({"txid": txid, "status": "pending"}));
+    let requests = node.join().unwrap();
+    assert!(requests[0].starts_with(&format!("GET /v1/txs/{txid} HTTP/1.0")));
+}
+
+#[test]
+fn an_included_proof_request_names_its_proof_and_the_block_of_the_light_nodes_own_headers() {
+    let tx = request();
+    let txid = text(&SignedTxView::from(&tx).txid);
+    let (url, node) = fake_node(vec![http(
+        "200 OK",
+        "application/json",
+        &tx_view(&tx, Some(3)),
+    )]);
+    let (api, headers) = api_asking("jobincluded", 5, &url);
+    let (status, body) = call(&api, &format!("/v1/light/proof-jobs/{txid}"), true);
+    assert_eq!(status, 200);
+    assert_eq!(
+        json_of(&body),
+        json!({
+            "txid": txid,
+            "status": "included",
+            "proof_hash": text(&ProofHash(Hash32([5; 32]))),
+            "height": 3,
+            "block": text(&block_id(&headers[3])),
+        })
+    );
+    node.join().unwrap();
+}
+
+#[test]
+fn a_proof_job_in_a_block_the_light_node_does_not_hold_is_unknown_block() {
+    let tx = request();
+    let txid = text(&SignedTxView::from(&tx).txid);
+    let (url, node) = fake_node(vec![http(
+        "200 OK",
+        "application/json",
+        &tx_view(&tx, Some(40)),
+    )]);
+    let (api, _) = api_asking("jobahead", 5, &url);
+    let (status, body) = call(&api, &format!("/v1/light/proof-jobs/{txid}"), true);
+    assert_eq!((status, error_code(&body)), (404, json!("unknown_block")));
+    node.join().unwrap();
+}
+
+#[test]
+fn a_tx_that_is_not_a_proof_request_or_is_unknown_is_not_a_proof_job() {
+    let tx = transfer();
+    let txid = text(&SignedTxView::from(&tx).txid);
+    let (url, node) = fake_node(vec![
+        http("200 OK", "application/json", &tx_view(&tx, None)),
+        http("404 Not Found", "application/json", b"{}"),
+    ]);
+    let (api, _) = api_asking("jobnot", 2, &url);
+    for _ in 0..2 {
+        let (status, body) = call(&api, &format!("/v1/light/proof-jobs/{txid}"), true);
+        assert_eq!(status, 404);
+        assert_eq!(error_code(&body), json!("unknown_proof_job"));
+    }
+    node.join().unwrap();
 }

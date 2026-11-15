@@ -11,6 +11,7 @@ use pouw_light_node::{
     api::{self, LightApi},
     config::LightConfig,
     headers::HeaderStore,
+    upstream::Upstream,
 };
 use signal_hook::{
     consts::{SIGINT, SIGTERM},
@@ -80,7 +81,11 @@ fn main() -> ExitCode {
         full_nodes = config.full_nodes.len(),
         "light node started"
     );
-    let api = Arc::new(LightApi::new(headers));
+    let upstream = Upstream::new(&config.full_nodes);
+    if upstream.len() < config.full_nodes.len() {
+        warn!("only http:// full nodes are used, the others are left out");
+    }
+    let api = Arc::new(LightApi::new(headers, upstream));
     let server = thread::Builder::new()
         .name("api".to_owned())
         .spawn(move || api::serve(&listener, &api));
