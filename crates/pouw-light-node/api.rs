@@ -37,7 +37,8 @@ use pouw_api::{
 };
 use pouw_crypto::Address;
 use pouw_types::{
-    BlockHeader, BlockId, ChainId, Height, ProofHash, TxId, TxKind, block_id, verify_inclusion,
+    BlockHeader, BlockId, ChainId, Height, ProofHash, ProofTx, TxId, TxKind, block_id,
+    proof_tx_hash, txid as txid_of, verify_inclusion,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -158,7 +159,7 @@ impl Reply {
         Self::error(
             "502 Bad Gateway",
             "upstream_invalid",
-            "the inclusion proof of the full node does not match the header of the light node",
+            "the answer of the full node does not match the request or the header of the light node",
         )
     }
 
@@ -291,6 +292,7 @@ fn check_inclusion(
     api: &LightApi,
     txid: &str,
     height: Height,
+    index: Option<u32>,
     header: &BlockHeader,
     leaf: &ProofHash,
 ) -> Result<(), Reply> {
@@ -304,6 +306,7 @@ fn check_inclusion(
     let valid = answer.status == 200
         && serde_json::from_slice::<InclusionProof>(&answer.body).is_ok_and(|proof| {
             proof.height == height
+                && Some(proof.index) == index
                 && verify_inclusion(
                     &header.tx_root,
                     &leaf.0,
@@ -338,12 +341,31 @@ fn proof_job(api: &LightApi, txid: &str) -> Reply {
         warn!("a full node answered a tx that does not parse");
         return Reply::bad_gateway();
     };
+    // the answer must be about the tx that was asked for, whatever ids it carries
+    if view.txid.to_string() != txid
+        || view.tx.txid.to_string() != txid
+        || txid_of(&view.tx.tx).to_string() != txid
+    {
+        warn!(%txid, "a full node answered about another tx");
+        return Reply::invalid_upstream();
+    }
     if !matches!(view.tx.tx.body.kind, TxKind::ProofRequest { .. }) {
         return Reply::not_found(UNKNOWN_PROOF_JOB, "not a proof request");
     }
     let job = match (view.status, view.height, view.proof) {
         (TxStatus::Pending, _, _) => ProofJob::Pending { txid: view.txid },
         (TxStatus::Included, Some(height), Some(proof)) => {
+            // the proof hash is the leaf of the proof tx, which holds this request: it
+            // is computed from what the answer says and must be the one it claims
+            let proof_tx = ProofTx {
+                request: view.tx.tx.clone(),
+                usage_counter: proof.usage_counter,
+                proof: proof.proof.clone(),
+            };
+            if proof_tx_hash(&proof_tx) != proof.proof_hash {
+                warn!(%txid, "the proof hash of a full node is not the hash of its proof tx");
+                return Reply::invalid_upstream();
+            }
             let held = match api.read(|store| store.get(height)) {
                 Ok(Some(held)) => held,
                 Ok(None) => {
@@ -354,7 +376,9 @@ fn proof_job(api: &LightApi, txid: &str) -> Reply {
                 }
                 Err(reply) => return reply,
             };
-            if let Err(reply) = check_inclusion(api, &txid, height, &held, &proof.proof_hash) {
+            if let Err(reply) =
+                check_inclusion(api, &txid, height, view.index, &held, &proof.proof_hash)
+            {
                 return reply;
             }
             ProofJob::Included {

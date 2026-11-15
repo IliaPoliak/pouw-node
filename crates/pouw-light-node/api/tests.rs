@@ -11,8 +11,8 @@ use pouw_api::view::{HeaderView, IncludedProof, InclusionProof, SignedTxView, Tx
 use pouw_crypto::{Address, FieldInput, Hash32, Signature};
 use pouw_types::{
     Amount, BlockHeader, BlockId, ChainId, CircuitId, Height, Nonce, ProofHash, ProofSystem,
-    SignedTx, Target, TxBody, TxId, TxKind, U32, U64, UsageCounter, block_id, bound_root,
-    inclusion_proof, leaf_count_u32, merkle_root,
+    ProofTx, SignedTx, Target, TxBody, TxId, TxKind, U32, U64, UsageCounter, block_id, bound_root,
+    inclusion_proof, leaf_count_u32, merkle_root, proof_tx_hash,
 };
 use serde_json::{Value, json};
 
@@ -301,14 +301,14 @@ fn tx_view(tx: &SignedTx, height: Option<u64>) -> Vec<u8> {
             status: TxStatus::Included,
             tx: signed,
             height: Some(Height(height)),
-            index: Some(0),
+            index: Some(1),
             proof: Some(IncludedProof {
                 eta: FieldInput([1; 31]),
                 mask: FieldInput([2; 31]),
                 proof_system: ProofSystem::PlonkKzg,
                 usage_counter: UsageCounter(1),
                 proof: Box::from([4, 5]),
-                proof_hash: ProofHash(Hash32([5; 32])),
+                proof_hash: proved(tx),
             }),
         },
     };
@@ -469,7 +469,7 @@ fn an_included_proof_request_names_its_proof_and_the_block_of_the_light_nodes_ow
         json!({
             "txid": txid,
             "status": "included",
-            "proof_hash": text(&ProofHash(Hash32([5; 32]))),
+            "proof_hash": text(&proved(&request())),
             "height": 3,
             "block": text(&block_id(&headers[3])),
         })
@@ -511,7 +511,7 @@ fn a_tx_that_is_not_a_proof_request_or_is_unknown_is_not_a_proof_job() {
 /// The leaves of a block of three entries. The second is the proof hash of the tx views
 /// of `tx_view`.
 fn leaves() -> Vec<Hash32> {
-    vec![Hash32([1; 32]), Hash32([5; 32]), Hash32([3; 32])]
+    vec![Hash32([1; 32]), proved(&request()).0, Hash32([3; 32])]
 }
 
 /// The `tx_root` of a block with these leaves.
@@ -608,4 +608,78 @@ fn a_proof_job_is_not_included_when_the_proof_does_not_fit_the_local_header() {
         http("404 Not Found", "application/json", b"{}"),
     ));
     invalid(job_with("garbage", &headers, 3, json(b"not json")));
+}
+
+/// The proof hash of the proof tx the views of `tx_view` describe for `tx`: the leaf the
+/// full node reports.
+fn proved(tx: &SignedTx) -> ProofHash {
+    proof_tx_hash(&ProofTx {
+        request: tx.clone(),
+        usage_counter: UsageCounter(1),
+        proof: Box::from([4, 5]),
+    })
+}
+
+/// Like `job_with`, but the answers of the full node (whole HTTP answers: the tx view,
+/// then the inclusion proof when it is asked for) are given as they are.
+fn job_of(name: &str, headers: &[BlockHeader], answers: Vec<Vec<u8>>) -> (u16, Value) {
+    let txid = text(&SignedTxView::from(&request()).txid);
+    let (url, node) = fake_node(answers);
+    let mut store = HeaderStore::open(&path(name), 8).unwrap();
+    for next in headers {
+        store.push(*next).unwrap();
+    }
+    let api = LightApi::new(store, Upstream::new(&[url]));
+    let (status, body) = call(&api, &format!("/v1/light/proof-jobs/{txid}"), true);
+    node.join().unwrap();
+    (status, json_of(&body))
+}
+
+fn upstream_invalid((status, job): (u16, Value)) {
+    assert_eq!(status, 502);
+    assert_eq!(job["error"]["code"], json!("upstream_invalid"));
+}
+
+#[test]
+fn a_proof_job_is_not_included_when_the_answer_is_not_about_its_request_or_its_proof_hash() {
+    let leaves = leaves();
+    let headers = rooted_chain(5, 3, root_of(&leaves));
+    let json = |value: &Value| {
+        http(
+            "200 OK",
+            "application/json",
+            &serde_json::to_vec(value).unwrap(),
+        )
+    };
+    let included = |tx: &SignedTx| json_of(&tx_view(tx, Some(3)));
+    let asked = text(&SignedTxView::from(&request()).txid);
+    let mut other = request();
+    other.body.nonce = Nonce(9);
+
+    // the view of another tx is the answer
+    upstream_invalid(job_of("othertx", &headers, vec![json(&included(&other))]));
+
+    // the ids say the request, the tx in the answer is another
+    let mut relabelled = included(&other);
+    relabelled["txid"] = json!(asked);
+    relabelled["tx"]["txid"] = json!(asked);
+    upstream_invalid(job_of("relabelled", &headers, vec![json(&relabelled)]));
+
+    // the proof hash is not the hash of the proof tx the answer describes, though it is a
+    // leaf of the block
+    let mut forged = included(&request());
+    forged["proof_hash"] = json!(text(&ProofHash(leaves[0])));
+    upstream_invalid(job_of("forged", &headers, vec![json(&forged)]));
+
+    // the tx claims another position than the path it is proved with
+    let mut moved = included(&request());
+    moved["index"] = json!(2);
+    upstream_invalid(job_of(
+        "moved",
+        &headers,
+        vec![
+            json(&moved),
+            http("200 OK", "application/json", &inclusion_json(3, &leaves, 1)),
+        ],
+    ));
 }
