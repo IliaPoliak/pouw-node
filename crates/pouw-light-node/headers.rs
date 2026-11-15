@@ -177,6 +177,16 @@ impl HeaderStore {
         self.cache.len()
     }
 
+    /// The header with id `id`, if it is among the last N headers kept in memory. The
+    /// file has no index by id, so an older header is not found by its id (it is by its
+    /// height, see [`HeaderStore::get`]).
+    pub fn find(&self, id: &BlockId) -> Option<BlockHeader> {
+        self.cache
+            .iter()
+            .find(|(cached, _)| cached == id)
+            .map(|(_, header)| *header)
+    }
+
     /// Appends `header`. The first header of an empty store is accepted as the anchor,
     /// every other one must extend the tip.
     ///

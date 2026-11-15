@@ -213,3 +213,14 @@ fn a_file_of_another_kind_is_refused() {
         Err(StoreError::BadMagic)
     ));
 }
+
+#[test]
+fn a_header_is_found_by_id_only_while_it_is_cached() {
+    let headers = chain(6);
+    let mut store = HeaderStore::open(&path("find"), 2).unwrap();
+    push_all(&mut store, &headers);
+    assert_eq!(store.find(&block_id(&headers[5])), Some(headers[5]));
+    assert_eq!(store.find(&block_id(&headers[4])), Some(headers[4]));
+    assert_eq!(store.find(&block_id(&headers[1])), None);
+    assert_eq!(store.get(Height(1)).unwrap(), Some(headers[1]));
+}

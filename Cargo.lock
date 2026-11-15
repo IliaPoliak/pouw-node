@@ -2592,9 +2592,13 @@ dependencies = [
 name = "pouw-light-node"
 version = "0.1.0"
 dependencies = [
+ "borsh",
  "pouw-api",
+ "pouw-consensus",
  "pouw-crypto",
  "pouw-types",
+ "serde",
+ "serde_json",
  "signal-hook",
  "thiserror 2.0.21",
  "tracing",

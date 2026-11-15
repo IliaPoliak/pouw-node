@@ -1,13 +1,17 @@
 //! The `pouw-light-node` binary: reads the configuration from the environment and
-//! serves `/health` until SIGINT or SIGTERM. `RUST_LOG` filters the log, `info` by
+//! serves `/health` and the header routes of the light API until SIGINT or SIGTERM. `RUST_LOG` filters the log, `info` by
 //! default.
 //!
 //! Exit codes: 0 after a shutdown signal, 1 when the light node cannot start, 2 for an
 //! invalid configuration.
 
-use std::{env, fs, net::TcpListener, process::ExitCode, thread};
+use std::{env, fs, net::TcpListener, process::ExitCode, sync::Arc, thread};
 
-use pouw_light_node::{config::LightConfig, headers::HeaderStore, health};
+use pouw_light_node::{
+    api::{self, LightApi},
+    config::LightConfig,
+    headers::HeaderStore,
+};
 use signal_hook::{
     consts::{SIGINT, SIGTERM},
     iterator::Signals,
@@ -76,11 +80,12 @@ fn main() -> ExitCode {
         full_nodes = config.full_nodes.len(),
         "light node started"
     );
+    let api = Arc::new(LightApi::new(headers));
     let server = thread::Builder::new()
-        .name("health".to_owned())
-        .spawn(move || health::serve(&listener));
+        .name("api".to_owned())
+        .spawn(move || api::serve(&listener, &api));
     if let Err(error) = server {
-        error!(%error, "cannot start the health thread");
+        error!(%error, "cannot start the API thread");
         return ExitCode::FAILURE;
     }
     if let Some(signal) = signals.forever().next() {
