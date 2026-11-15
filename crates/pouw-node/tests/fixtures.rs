@@ -28,7 +28,7 @@ use pouw_consensus::{
     median_time_past, next_target, state::apply,
 };
 use pouw_crypto::{Address, FieldInput, Hash32, SigningKey, hash_to_field};
-use pouw_provers::{MockProver, Statement};
+use pouw_provers::{MockProver, Prover, Statement};
 use pouw_types::{
     Account, Amount, Block, BlockHeader, ChainId, ChainSpec, CircuitId, ConstraintCount, Nonce,
     ProofSystem, ProofTx, SignedTx, SystemId, Target, Timestamp, TxBody, TxKind, U64, UsageCounter,
@@ -323,7 +323,8 @@ fn check(chain: &Chain) {
                 "the proof of block {index} verifies"
             );
         }
-        let diff = apply_block(params, &state, block, &txids).unwrap();
+        let node_prover = Prover::from(MockProver::default());
+        let diff = apply_block(params, &node_prover, &state, block, &txids).unwrap();
         apply(&mut state, &diff).unwrap();
     }
 }
