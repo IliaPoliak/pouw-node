@@ -19,12 +19,31 @@
 //! The channel is bounded and the swarm waits for a free slot before it reads the
 //! sockets again, as the module doc of [`p2p`](super) describes.
 //!
+//! - request-response, one protocol for `status` and one for `sync`, both with the frames
+//!   of `frames`. A `Status` is a request with an empty answer, sent once
+//!   by each side. A `sync` request goes to the transport as [`Wire::SyncRequest`] under a
+//!   number of the swarm, which holds the response channel of the request in a table until
+//!   the transport answers with [`ToSwarm::Answer`] or [`ToSwarm::Drop`]. A request of
+//!   the node ([`ToSwarm::Request`]) comes back as [`Wire::SyncResponse`] or, when it
+//!   fails or times out, as [`Wire::RequestFailed`]. A peer that sends a request is
+//!   reported as connected before the request is forwarded, because it may arrive before
+//!   the identify exchange is over: the protocol ids carry the network, so a peer that
+//!   speaks them is on this one.
+//!
+//! The transport commands the swarm with [`ToSwarm`] on a second channel, which the
+//! transport fills with `try_send` and never waits on.
+//!
 //! Not built yet, each is a part of pouw-node#85 or a later task: gossipsub, the
-//! request-response protocols for `Status` and `sync`, the connection limits of
-//! [`PeerLimits`](super::PeerLimits) and the ban list.
+//! connection limits of [`PeerLimits`](super::PeerLimits) and the ban list.
 
 use std::time::Duration;
-use std::{collections::HashSet, io, num::NonZeroUsize, sync::mpsc as std_mpsc, thread};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    num::NonZeroUsize,
+    sync::mpsc as std_mpsc,
+    thread,
+};
 
 use futures::StreamExt;
 use libp2p::{
@@ -33,9 +52,14 @@ use libp2p::{
     kad,
     multiaddr::Protocol,
     noise,
+    request_response::{
+        self, InboundRequestId, OutboundFailure, OutboundRequestId, ProtocolSupport,
+        ResponseChannel,
+    },
     swarm::{InvalidProtocol, NetworkBehaviour, SwarmEvent},
     tcp, yamux,
 };
+use pouw_types::NetworkName;
 use thiserror::Error;
 use tokio::{
     runtime,
@@ -45,7 +69,9 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use super::{
-    TransportConfig, WIRE_CAPACITY, Wire, WireIn,
+    NetworkError, RequestId, SWARM_COMMAND_CAPACITY, ServeId, SwarmIn, ToSwarm, TransportConfig,
+    TransportFailure, WIRE_CAPACITY, Wire, WireIn,
+    frames::FrameCodec,
     identity::{self, IdentityError},
     protocol,
 };
@@ -65,6 +91,12 @@ const REDIAL_INTERVAL: Duration = Duration::from_secs(10);
 /// protocols of the next tasks keep a connection busy, until then a long timeout keeps
 /// the peers connected.
 const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_hours(1);
+
+/// How long a `Status` waits for the empty answer that completes it.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a sync request waits for its answer, which may hold sixteen blocks.
+const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Why the swarm cannot start. Each is a fault of this node or of its configuration,
 /// never of a peer.
@@ -108,6 +140,11 @@ pub enum SwarmError {
 struct Behaviour {
     identify: identify::Behaviour,
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
+    /// `Status`, once per connection and side: the request is the status, the answer is
+    /// empty.
+    status: request_response::Behaviour<FrameCodec>,
+    /// `SyncRequest` and `SyncResponse`.
+    sync: request_response::Behaviour<FrameCodec>,
 }
 
 /// What the swarm remembers between events.
@@ -118,23 +155,50 @@ struct Book {
     reported: HashSet<PeerId>,
     /// Whether the one bootstrap query of this run was started.
     bootstrapped: bool,
+    /// The id of the next sync request handed to the transport.
+    next_serve: u64,
+    /// The sync requests of peers that wait for the answer of the node, by the number the
+    /// transport knows them by.
+    serving: HashMap<ServeId, Served>,
+    /// The same requests by their libp2p id, to find one that fails.
+    served_by: HashMap<InboundRequestId, ServeId>,
+    /// The sync requests of the node that wait for an answer.
+    asked: HashMap<OutboundRequestId, RequestId>,
+}
+
+/// A sync request of a peer and the channel its answer goes back on.
+#[derive(Debug)]
+struct Served {
+    peer: PeerId,
+    request: InboundRequestId,
+    channel: ResponseChannel<Vec<u8>>,
+}
+
+impl Book {
+    /// Forgets the requests of a peer whose last connection closed: nothing can answer them.
+    fn forget_peer(&mut self, peer: &PeerId) {
+        self.serving.retain(|_, served| served.peer != *peer);
+        let serving = &self.serving;
+        self.served_by.retain(|_, id| serving.contains_key(id));
+    }
 }
 
 /// Starts the swarm on its own thread and returns the channel it feeds. Returns when the
 /// swarm listens on at least one address of `config.listen`: an address the host cannot
 /// serve (IPv6 inside a container without it) is logged and skipped, but a node that
 /// cannot listen anywhere is an error here and not a silent node without peers.
-pub fn start(config: &TransportConfig) -> Result<WireIn, SwarmError> {
+pub fn start(config: &TransportConfig) -> Result<(WireIn, SwarmIn), SwarmError> {
     let keypair = identity::load_or_create(&config.data_dir)?;
     let (wire, wire_in) = mpsc::channel(WIRE_CAPACITY);
+    let (to_swarm, commands) = mpsc::channel(SWARM_COMMAND_CAPACITY);
     let (ready, ready_in) = std_mpsc::sync_channel(1);
     let config = config.clone();
     thread::Builder::new()
         .name("Swarm".to_owned())
-        .spawn(move || run(&config, keypair, &wire, &ready))
+        .spawn(move || run(&config, keypair, &wire, commands, &ready))
         .map_err(SwarmError::Thread)?;
     match ready_in.recv() {
-        Ok(Ok(())) => Ok(wire_in),
+        Ok(Ok(())) => Ok((wire_in, to_swarm)),
         Ok(Err(error)) => Err(error),
         Err(std_mpsc::RecvError) => Err(SwarmError::Gone),
     }
@@ -145,6 +209,7 @@ fn run(
     config: &TransportConfig,
     keypair: Keypair,
     wire: &mpsc::Sender<Wire>,
+    commands: mpsc::Receiver<ToSwarm>,
     ready: &std_mpsc::SyncSender<Result<(), SwarmError>>,
 ) {
     let runtime = match runtime::Builder::new_current_thread().enable_all().build() {
@@ -164,7 +229,7 @@ fn run(
         };
         tell(ready, Ok(()));
         let version = protocol::protocol_id(&config.network, IDENTIFY);
-        drive(swarm, &bootnodes, &version, wire).await;
+        drive(swarm, &bootnodes, &version, wire, commands).await;
     });
 }
 
@@ -215,6 +280,8 @@ fn build(config: &TransportConfig, keypair: Keypair) -> Result<Swarm<Behaviour>,
     let name = protocol::protocol_id(&config.network, KADEMLIA);
     let kademlia_protocol = StreamProtocol::try_from_owned(name.clone())
         .map_err(|source| SwarmError::ProtocolName { name, source })?;
+    let status_protocol = stream_protocol(&config.network, protocol::STATUS)?;
+    let sync_protocol = stream_protocol(&config.network, protocol::SYNC)?;
     let bucket =
         NonZeroUsize::new(config.limits.kademlia_bucket_size).ok_or(SwarmError::BucketSize)?;
     let agent = format!("pouw-node/{}", env!("CARGO_PKG_VERSION"));
@@ -238,14 +305,43 @@ fn build(config: &TransportConfig, keypair: Keypair) -> Result<Swarm<Behaviour>,
             kademlia.set_mode(Some(kad::Mode::Server));
             let identify_config =
                 identify::Config::new(version, key.public()).with_agent_version(agent);
+            let status_codec = FrameCodec {
+                max_request: protocol::MAX_STATUS_BYTES,
+                max_response: 0,
+            };
+            let sync_codec = FrameCodec {
+                max_request: protocol::MAX_SYNC_REQUEST_BYTES,
+                max_response: protocol::MAX_RESPONSE_BYTES,
+            };
+            let status_config =
+                request_response::Config::default().with_request_timeout(STATUS_TIMEOUT);
+            let sync_config =
+                request_response::Config::default().with_request_timeout(SYNC_TIMEOUT);
             Behaviour {
                 identify: identify::Behaviour::new(identify_config),
                 kademlia,
+                status: request_response::Behaviour::with_codec(
+                    status_codec,
+                    [(status_protocol, ProtocolSupport::Full)],
+                    status_config,
+                ),
+                sync: request_response::Behaviour::with_codec(
+                    sync_codec,
+                    [(sync_protocol, ProtocolSupport::Full)],
+                    sync_config,
+                ),
             }
         });
     Ok(builder
         .with_swarm_config(|config| config.with_idle_connection_timeout(IDLE_CONNECTION_TIMEOUT))
         .build())
+}
+
+/// The libp2p name of the protocol `name` on `network`.
+fn stream_protocol(network: &NetworkName, name: &str) -> Result<StreamProtocol, SwarmError> {
+    let id = protocol::protocol_id(network, name);
+    StreamProtocol::try_from_owned(id.clone())
+        .map_err(|source| SwarmError::ProtocolName { name: id, source })
 }
 
 fn parse(text: &str) -> Result<Multiaddr, SwarmError> {
@@ -264,13 +360,15 @@ fn split_peer(addr: &Multiaddr) -> Option<(PeerId, Multiaddr)> {
     }
 }
 
-/// Handles the swarm events until the transport thread is gone. Dials the bootnodes at
-/// once and again every [`REDIAL_INTERVAL`] while no peer is connected.
+/// Handles the swarm events and the commands of the transport until the transport thread
+/// is gone. Dials the bootnodes at once and again every [`REDIAL_INTERVAL`] while no peer
+/// is connected.
 async fn drive(
     mut swarm: Swarm<Behaviour>,
     bootnodes: &[Multiaddr],
     version: &str,
     wire: &mpsc::Sender<Wire>,
+    mut commands: mpsc::Receiver<ToSwarm>,
 ) {
     let mut book = Book::default();
     let mut redial = time::interval(REDIAL_INTERVAL);
@@ -279,6 +377,15 @@ async fn drive(
         tokio::select! {
             event = swarm.select_next_some() => {
                 if !on_event(&mut swarm, &mut book, version, event, wire).await {
+                    return;
+                }
+            }
+            command = commands.recv() => {
+                let Some(command) = command else {
+                    info!("the transport is gone, the swarm stops");
+                    return;
+                };
+                if !on_command(&mut swarm, &mut book, command, wire).await {
                     return;
                 }
             }
@@ -319,6 +426,7 @@ async fn on_event(
             ..
         } => {
             debug!(%peer_id, ?cause, "last connection closed");
+            book.forget_peer(&peer_id);
             if book.reported.remove(&peer_id) {
                 info!(%peer_id, "peer disconnected");
                 return send(wire, Wire::PeerDisconnected(peer_id.to_bytes())).await;
@@ -334,6 +442,12 @@ async fn on_event(
             is_new_peer,
             ..
         })) => debug!(%peer, is_new_peer, "routing table updated"),
+        SwarmEvent::Behaviour(BehaviourEvent::Status(event)) => {
+            return on_status(swarm, book, event, wire).await;
+        }
+        SwarmEvent::Behaviour(BehaviourEvent::Sync(event)) => {
+            return on_sync(book, event, wire).await;
+        }
         _ => {}
     }
     true
@@ -380,6 +494,216 @@ async fn on_identified(
     true
 }
 
+/// Reports `peer` to the transport if it was not yet. A peer can send a request before the
+/// identify exchange is over, and the transport drops what comes from a peer it does not
+/// know. The protocol ids carry the network, so a peer that gets this far is on ours.
+async fn report_peer(book: &mut Book, peer: PeerId, wire: &mpsc::Sender<Wire>) -> bool {
+    if book.reported.insert(peer) {
+        info!(%peer, "peer connected");
+        return send(wire, Wire::PeerConnected(peer.to_bytes())).await;
+    }
+    true
+}
+
+/// Handles one command of the transport. `false` means the transport thread is gone.
+async fn on_command(
+    swarm: &mut Swarm<Behaviour>,
+    book: &mut Book,
+    command: ToSwarm,
+    wire: &mpsc::Sender<Wire>,
+) -> bool {
+    match command {
+        ToSwarm::Request { id, peer, bytes } => {
+            let Ok(peer) = PeerId::from_bytes(&peer) else {
+                let error = NetworkError::Transport(TransportFailure::DialFailure);
+                return send(wire, Wire::RequestFailed { id, error }).await;
+            };
+            let asked = swarm.behaviour_mut().sync.send_request(&peer, bytes);
+            book.asked.insert(asked, id);
+        }
+        ToSwarm::Answer { id, bytes } => {
+            if let Some(served) = book.serving.remove(&id) {
+                book.served_by.remove(&served.request);
+                if swarm
+                    .behaviour_mut()
+                    .sync
+                    .send_response(served.channel, bytes)
+                    .is_err()
+                {
+                    debug!(?id, "the peer is gone, the answer is dropped");
+                }
+            } else {
+                debug!(?id, "an answer to a request that is gone");
+            }
+        }
+        ToSwarm::Drop { id } => {
+            if let Some(served) = book.serving.remove(&id) {
+                book.served_by.remove(&served.request);
+                debug!(?id, peer = %served.peer, "a request is left unanswered");
+            }
+        }
+        ToSwarm::Status { peer, bytes } => match PeerId::from_bytes(&peer) {
+            Ok(peer) => {
+                swarm.behaviour_mut().status.send_request(&peer, bytes);
+            }
+            Err(error) => debug!(%error, "a status for a peer id that does not parse"),
+        },
+        ToSwarm::Disconnect { peer } => match PeerId::from_bytes(&peer) {
+            Ok(peer) => {
+                if swarm.disconnect_peer_id(peer).is_err() {
+                    debug!(%peer, "no connection to close");
+                }
+            }
+            Err(error) => debug!(%error, "a disconnect for a peer id that does not parse"),
+        },
+    }
+    true
+}
+
+/// Handles an event of the `status` protocol: the status of a peer is acknowledged with
+/// an empty answer and handed to the transport. What happens to our own status, an
+/// answer or a failure, is only logged: the node sends it once and does not wait for it.
+async fn on_status(
+    swarm: &mut Swarm<Behaviour>,
+    book: &mut Book,
+    event: request_response::Event<Vec<u8>, Vec<u8>>,
+    wire: &mpsc::Sender<Wire>,
+) -> bool {
+    match event {
+        request_response::Event::Message {
+            peer,
+            message:
+                request_response::Message::Request {
+                    request, channel, ..
+                },
+            ..
+        } => {
+            if swarm
+                .behaviour_mut()
+                .status
+                .send_response(channel, Vec::new())
+                .is_err()
+            {
+                debug!(%peer, "the peer left before its status was acknowledged");
+            }
+            if !report_peer(book, peer, wire).await {
+                return false;
+            }
+            return send(
+                wire,
+                Wire::Status {
+                    from: peer.to_bytes(),
+                    bytes: request,
+                },
+            )
+            .await;
+        }
+        request_response::Event::OutboundFailure { peer, error, .. } => {
+            debug!(%peer, %error, "our status was not delivered");
+        }
+        request_response::Event::InboundFailure { peer, error, .. } => {
+            debug!(%peer, %error, "a status could not be acknowledged");
+        }
+        _ => {}
+    }
+    true
+}
+
+/// Handles an event of the `sync` protocol.
+async fn on_sync(
+    book: &mut Book,
+    event: request_response::Event<Vec<u8>, Vec<u8>>,
+    wire: &mpsc::Sender<Wire>,
+) -> bool {
+    match event {
+        request_response::Event::Message {
+            peer,
+            message:
+                request_response::Message::Request {
+                    request_id,
+                    request,
+                    channel,
+                },
+            ..
+        } => {
+            if !report_peer(book, peer, wire).await {
+                return false;
+            }
+            let id = ServeId(book.next_serve);
+            book.next_serve = book.next_serve.wrapping_add(1);
+            let served = Served {
+                peer,
+                request: request_id,
+                channel,
+            };
+            book.serving.insert(id, served);
+            book.served_by.insert(request_id, id);
+            return send(
+                wire,
+                Wire::SyncRequest {
+                    id,
+                    from: peer.to_bytes(),
+                    bytes: request,
+                },
+            )
+            .await;
+        }
+        request_response::Event::Message {
+            message:
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                },
+            ..
+        } => {
+            if let Some(id) = book.asked.remove(&request_id) {
+                return send(
+                    wire,
+                    Wire::SyncResponse {
+                        id,
+                        bytes: response,
+                    },
+                )
+                .await;
+            }
+        }
+        request_response::Event::OutboundFailure {
+            request_id, error, ..
+        } => {
+            if let Some(id) = book.asked.remove(&request_id) {
+                debug!(?id, %error, "a sync request failed");
+                let error = network_error(error);
+                return send(wire, Wire::RequestFailed { id, error }).await;
+            }
+        }
+        request_response::Event::InboundFailure {
+            request_id, error, ..
+        } => {
+            debug!(%error, "a sync request cannot be answered");
+            if let Some(id) = book.served_by.remove(&request_id) {
+                book.serving.remove(&id);
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
+/// The error of the node for a request that failed in libp2p, one to one.
+fn network_error(failure: OutboundFailure) -> NetworkError {
+    match failure {
+        OutboundFailure::Timeout => NetworkError::Timeout,
+        OutboundFailure::DialFailure => NetworkError::Transport(TransportFailure::DialFailure),
+        OutboundFailure::ConnectionClosed => {
+            NetworkError::Transport(TransportFailure::ConnectionClosed)
+        }
+        OutboundFailure::UnsupportedProtocols => {
+            NetworkError::Transport(TransportFailure::UnsupportedProtocols)
+        }
+        OutboundFailure::Io(error) => NetworkError::Transport(TransportFailure::Io(error.kind())),
+    }
+}
+
 /// Hands a message to the transport thread, waiting while its channel is full. That wait
 /// is the backpressure of the swarm: it reads no socket meanwhile.
 async fn send(wire: &mpsc::Sender<Wire>, message: Wire) -> bool {
@@ -411,6 +735,7 @@ mod tests {
     struct Node {
         peer: PeerId,
         wire: WireIn,
+        commands: SwarmIn,
         addr: String,
         dir: PathBuf,
     }
@@ -427,7 +752,7 @@ mod tests {
             limits: PeerLimits::default(),
             data_dir: dir.clone(),
         };
-        let wire = start(&config).unwrap();
+        let (wire, commands) = start(&config).unwrap();
         let peer = identity::load_or_create(&dir)
             .unwrap()
             .public()
@@ -435,6 +760,7 @@ mod tests {
         Node {
             peer,
             wire,
+            commands,
             addr: format!("/ip4/127.0.0.1/tcp/{port}"),
             dir,
         }
@@ -462,6 +788,46 @@ mod tests {
         peers
     }
 
+    /// The first message `pick` takes among those a node hands to the transport within
+    /// `time`.
+    fn wire_within<T>(
+        node: &mut Node,
+        time: Duration,
+        mut pick: impl FnMut(Wire) -> Option<T>,
+    ) -> Option<T> {
+        let runtime = runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let start = Instant::now();
+        loop {
+            let left = time.saturating_sub(start.elapsed());
+            match runtime.block_on(async { time::timeout(left, node.wire.recv()).await }) {
+                Ok(Some(message)) => {
+                    if let Some(found) = pick(message) {
+                        return Some(found);
+                    }
+                }
+                Ok(None) | Err(_) => return None,
+            }
+        }
+    }
+
+    /// Two nodes on one network that have reported each other.
+    fn connected_pair(test: &str) -> (Node, Node) {
+        let mut a = start_node(test, "a", "devnet", vec![]);
+        let mut b = start_node(test, "b", "devnet", vec![a.addr.clone()]);
+        assert_eq!(
+            connected_within(&mut b, Duration::from_secs(20), 1),
+            [a.peer]
+        );
+        assert_eq!(
+            connected_within(&mut a, Duration::from_secs(20), 1),
+            [b.peer]
+        );
+        (a, b)
+    }
+
     fn clean(nodes: &[&Node]) {
         for node in nodes {
             drop(fs::remove_dir_all(&node.dir));
@@ -477,6 +843,104 @@ mod tests {
         assert_eq!(seen_by_b, [a.peer]);
         assert_eq!(seen_by_a, [b.peer]);
         clean(&[&a, &b]);
+    }
+
+    const WAIT: Duration = Duration::from_secs(20);
+
+    #[test]
+    fn a_status_and_a_sync_exchange_cross_between_two_swarms() {
+        let (mut a, mut b) = connected_pair("exchange");
+
+        // the status of a reaches b, which answers it by itself
+        let status = ToSwarm::Status {
+            peer: b.peer.to_bytes(),
+            bytes: b"status".to_vec(),
+        };
+        a.commands.try_send(status).unwrap();
+        let got = wire_within(&mut b, WAIT, |message| match message {
+            Wire::Status { from, bytes } => Some((from, bytes)),
+            _ => None,
+        });
+        assert_eq!(got, Some((a.peer.to_bytes(), b"status".to_vec())));
+
+        // a request of a is answered by b, with an answer of several MiB
+        let ask = ToSwarm::Request {
+            id: RequestId(5),
+            peer: b.peer.to_bytes(),
+            bytes: b"ask".to_vec(),
+        };
+        a.commands.try_send(ask).unwrap();
+        let served = wire_within(&mut b, WAIT, |message| match message {
+            Wire::SyncRequest { id, from, bytes } => Some((id, from, bytes)),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!((served.1, served.2), (a.peer.to_bytes(), b"ask".to_vec()));
+        let answer = vec![7u8; 3 << 20];
+        let reply = ToSwarm::Answer {
+            id: served.0,
+            bytes: answer.clone(),
+        };
+        b.commands.try_send(reply).unwrap();
+        let got = wire_within(&mut a, WAIT, |message| match message {
+            Wire::SyncResponse { id, bytes } => Some((id, bytes)),
+            _ => None,
+        });
+        assert_eq!(got, Some((RequestId(5), answer)));
+        clean(&[&a, &b]);
+    }
+
+    #[test]
+    fn a_request_the_peer_drops_fails_at_the_asker() {
+        let (mut a, mut b) = connected_pair("dropped");
+        let ask = ToSwarm::Request {
+            id: RequestId(6),
+            peer: b.peer.to_bytes(),
+            bytes: b"ask".to_vec(),
+        };
+        a.commands.try_send(ask).unwrap();
+        let served = wire_within(&mut b, WAIT, |message| match message {
+            Wire::SyncRequest { id, .. } => Some(id),
+            _ => None,
+        })
+        .unwrap();
+        b.commands.try_send(ToSwarm::Drop { id: served }).unwrap();
+        let failed = wire_within(&mut a, WAIT, |message| match message {
+            Wire::RequestFailed { id, error } => Some((id, error)),
+            _ => None,
+        });
+        let Some((id, error)) = failed else {
+            panic!("the request did not fail");
+        };
+        assert_eq!(id, RequestId(6));
+        assert!(matches!(
+            error,
+            NetworkError::Transport(_) | NetworkError::Timeout
+        ));
+        clean(&[&a, &b]);
+    }
+
+    #[test]
+    fn a_request_to_a_peer_that_cannot_be_reached_fails() {
+        let mut a = start_node("lonely", "a", "devnet", vec![]);
+        let ask = ToSwarm::Request {
+            id: RequestId(7),
+            peer: b"not a peer id".to_vec(),
+            bytes: b"ask".to_vec(),
+        };
+        a.commands.try_send(ask).unwrap();
+        let failed = wire_within(&mut a, WAIT, |message| match message {
+            Wire::RequestFailed { id, error } => Some((id, error)),
+            _ => None,
+        });
+        assert_eq!(
+            failed,
+            Some((
+                RequestId(7),
+                NetworkError::Transport(TransportFailure::DialFailure)
+            ))
+        );
+        clean(&[&a]);
     }
 
     #[test]
