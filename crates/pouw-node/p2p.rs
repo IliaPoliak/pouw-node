@@ -353,8 +353,8 @@ pub struct Scores {
 #[must_use]
 pub enum Standing {
     Tolerated,
-    /// The score reached [`BAN_SCORE`]: the swarm of pouw-node#85 disconnects the peer
-    /// and refuses it for [`BAN_DURATION`].
+    /// The score reached [`BAN_SCORE`]: the transport asks the swarm to disconnect the
+    /// peer and refuse it for [`BAN_DURATION`], see [`ToSwarm::Ban`].
     Banned,
 }
 
@@ -646,6 +646,8 @@ pub enum ToSwarm {
     Status { peer: Vec<u8>, bytes: Vec<u8> },
     /// Close the connections to `peer`.
     Disconnect { peer: Vec<u8> },
+    /// Close the connections to `peer` and refuse it for [`BAN_DURATION`].
+    Ban { peer: Vec<u8> },
 }
 
 /// Capacity of the channel from the transport to the swarm. The transport sends with
@@ -777,9 +779,7 @@ pub struct TransportConfig {
 }
 
 /// Builds the libp2p swarm of the node and returns the channel it feeds ([`WireIn`]) and
-/// the channel that commands it ([`SwarmIn`]). Identify, Kademlia, the request-response
-/// protocols `status` and `sync` and gossipsub are built; the connection limit and the
-/// ban list of the list below are not.
+/// the channel that commands it ([`SwarmIn`]). Everything of the list below is built.
 ///
 /// To build, pouw-node#85:
 /// - identify, so a peer learns the listen addresses and the protocol ids of another
@@ -1200,11 +1200,15 @@ fn apply_penalty(transport: &mut Transport, peer: PeerIx, why: Misbehavior) {
     };
     match penalize(&mut transport.scores, peer, why) {
         Standing::Tolerated => debug!(?id, ?why, "peer penalized"),
-        Standing::Banned => warn!(
-            ?id,
-            ?why,
-            "pouw-node#85: peer banned, no swarm to disconnect it"
-        ),
+        Standing::Banned => {
+            warn!(?id, ?why, "peer banned");
+            let command = ToSwarm::Ban {
+                peer: id.as_bytes().to_vec(),
+            };
+            if let Err(error) = ask_swarm(transport, command) {
+                warn!(%error, "the swarm did not take a ban");
+            }
+        }
     }
 }
 
@@ -1916,6 +1920,23 @@ mod tests {
             assert_eq!((id, acceptance), (MessageId(want), how));
         }
         assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_peer_that_reaches_the_ban_score_is_banned_at_the_swarm() {
+        let (to_swarm, mut commands) = mpsc::channel(4);
+        let mut transport = Transport {
+            swarm: Some(to_swarm),
+            ..Transport::default()
+        };
+        let ix = connect(&mut transport.peers, peer()).unwrap().unwrap();
+        apply_penalty(&mut transport, ix, Misbehavior::Malformed);
+        assert!(commands.try_recv().is_err());
+        apply_penalty(&mut transport, ix, Misbehavior::InvalidBlock);
+        let Ok(ToSwarm::Ban { peer: banned }) = commands.try_recv() else {
+            panic!("no ban for the swarm");
+        };
+        assert_eq!(banned, peer().as_bytes().to_vec());
     }
 
     #[test]

@@ -40,8 +40,13 @@
 //! The transport commands the swarm with [`ToSwarm`] on a second channel, which the
 //! transport fills with `try_send` and never waits on.
 //!
-//! Not built yet, each is a part of a later task: the connection limits of
-//! [`PeerLimits`](super::PeerLimits) and the ban list.
+//! - connection limits: at most `max_inbound` established incoming and `max_outbound`
+//!   established outgoing connections of [`PeerLimits`](super::PeerLimits), and as many
+//!   incoming connections still in the handshake as `max_inbound`. A connection beyond a
+//!   limit is refused.
+//! - the ban list: [`ToSwarm::Ban`] closes the connections of a peer and refuses it for
+//!   [`BAN_DURATION`]. The list holds at most `MAX_BANNED` peers, the oldest ban is
+//!   lifted when it is full, and the sweep lifts a ban when its time is over.
 
 use std::time::{Duration, Instant};
 use std::{
@@ -54,7 +59,8 @@ use std::{
 
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, TransportError,
+    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, TransportError, allow_block_list,
+    connection_limits::{self, ConnectionLimits},
     gossipsub::{self, IdentTopic, MessageAcceptance},
     identify,
     identity::Keypair,
@@ -65,7 +71,7 @@ use libp2p::{
         self, InboundRequestId, OutboundFailure, OutboundRequestId, ProtocolSupport,
         ResponseChannel,
     },
-    swarm::{InvalidProtocol, NetworkBehaviour, SwarmEvent},
+    swarm::{InvalidProtocol, SwarmEvent},
     tcp, yamux,
 };
 use pouw_types::NetworkName;
@@ -78,8 +84,8 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use super::{
-    Acceptance, MessageId, NetworkError, RequestId, SWARM_COMMAND_CAPACITY, ServeId, SwarmIn,
-    ToSwarm, TransportConfig, TransportFailure, WIRE_CAPACITY, Wire, WireIn,
+    Acceptance, BAN_DURATION, MessageId, NetworkError, RequestId, SWARM_COMMAND_CAPACITY, ServeId,
+    SwarmIn, ToSwarm, TransportConfig, TransportFailure, WIRE_CAPACITY, Wire, WireIn,
     frames::FrameCodec,
     identity::{self, IdentityError},
     protocol, subscriptions,
@@ -112,6 +118,10 @@ const PENDING_TTL: Duration = Duration::from_secs(30);
 
 /// How often the swarm looks for gossip messages that wait too long.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How many peers the ban list holds. A peer id costs an attacker nothing, so the list is
+/// bounded: when it is full the oldest ban is lifted for a new one.
+const MAX_BANNED: usize = 4096;
 
 /// How long a `Status` waits for the empty answer that completes it.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -159,17 +169,39 @@ pub enum SwarmError {
     Gone,
 }
 
-#[derive(NetworkBehaviour)]
-struct Behaviour {
-    identify: identify::Behaviour,
-    kademlia: kad::Behaviour<kad::store::MemoryStore>,
-    /// `Status`, once per connection and side: the request is the status, the answer is
-    /// empty.
-    status: request_response::Behaviour<FrameCodec>,
-    /// `SyncRequest` and `SyncResponse`.
-    sync: request_response::Behaviour<FrameCodec>,
-    /// The messages of the topics of [`subscriptions`].
-    gossipsub: gossipsub::Behaviour,
+use behaviour::{Behaviour, BehaviourEvent};
+
+mod behaviour {
+    #![allow(
+        unreachable_code,
+        reason = "the derive matches on the events of behaviours that have none"
+    )]
+
+    use libp2p::{
+        allow_block_list::{self, BlockedPeers},
+        connection_limits, gossipsub, identify, kad, request_response,
+        swarm::NetworkBehaviour,
+    };
+
+    use crate::p2p::frames::FrameCodec;
+
+    #[derive(NetworkBehaviour)]
+    pub(super) struct Behaviour {
+        /// Refuses the connections beyond the limits of
+        /// [`PeerLimits`](crate::p2p::PeerLimits).
+        pub(super) limits: connection_limits::Behaviour,
+        /// Refuses the peers of the ban list.
+        pub(super) blocked: allow_block_list::Behaviour<BlockedPeers>,
+        pub(super) identify: identify::Behaviour,
+        pub(super) kademlia: kad::Behaviour<kad::store::MemoryStore>,
+        /// `Status`, once per connection and side: the request is the status, the answer
+        /// is empty.
+        pub(super) status: request_response::Behaviour<FrameCodec>,
+        /// `SyncRequest` and `SyncResponse`.
+        pub(super) sync: request_response::Behaviour<FrameCodec>,
+        /// The messages of the topics of [`subscriptions`](crate::p2p::subscriptions).
+        pub(super) gossipsub: gossipsub::Behaviour,
+    }
 }
 
 /// A gossip message that waits for the verdict of the node.
@@ -204,6 +236,8 @@ struct Book {
     pending: HashMap<u64, Pending>,
     /// The number of the next gossip message handed to the transport.
     next_message: u64,
+    /// The banned peers and when each was banned. Holds at most [`MAX_BANNED`] entries.
+    banned: HashMap<PeerId, Instant>,
 }
 
 /// A sync request of a peer and the channel its answer goes back on.
@@ -325,6 +359,10 @@ fn build(config: &TransportConfig, keypair: Keypair) -> Result<Swarm<Behaviour>,
     let bucket =
         NonZeroUsize::new(config.limits.kademlia_bucket_size).ok_or(SwarmError::BucketSize)?;
     let gossipsub = build_gossipsub(config, &keypair)?;
+    let limits = ConnectionLimits::default()
+        .with_max_established_incoming(Some(config.limits.max_inbound))
+        .with_max_established_outgoing(Some(config.limits.max_outbound))
+        .with_max_pending_incoming(Some(config.limits.max_inbound));
     let agent = format!("pouw-node/{}", env!("CARGO_PKG_VERSION"));
     let Ok(builder) = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
@@ -372,6 +410,8 @@ fn build(config: &TransportConfig, keypair: Keypair) -> Result<Swarm<Behaviour>,
                     sync_config,
                 ),
                 gossipsub,
+                limits: connection_limits::Behaviour::new(limits),
+                blocked: allow_block_list::Behaviour::default(),
             }
         });
     Ok(builder
@@ -589,9 +629,47 @@ fn report(swarm: &mut Swarm<Behaviour>, pending: &Pending, acceptance: MessageAc
     debug!(?outcome, id = %pending.id, "verdict passed to gossipsub");
 }
 
+/// Puts `peer` on the ban list for [`BAN_DURATION`] and closes its connections. When the
+/// list is full the oldest ban is lifted first.
+fn ban(swarm: &mut Swarm<Behaviour>, book: &mut Book, peer: PeerId) {
+    if book.banned.len() >= MAX_BANNED && !book.banned.contains_key(&peer) {
+        let oldest = book
+            .banned
+            .iter()
+            .min_by_key(|(_, since)| **since)
+            .map(|(oldest, _)| *oldest);
+        if let Some(oldest) = oldest {
+            book.banned.remove(&oldest);
+            swarm.behaviour_mut().blocked.unblock_peer(oldest);
+        }
+    }
+    book.banned.insert(peer, Instant::now());
+    swarm.behaviour_mut().blocked.block_peer(peer);
+    if swarm.disconnect_peer_id(peer).is_err() {
+        debug!(%peer, "no connection to close");
+    }
+    info!(%peer, "peer banned");
+}
+
+/// Lifts the bans whose [`BAN_DURATION`] is over.
+fn lift_bans(swarm: &mut Swarm<Behaviour>, book: &mut Book) {
+    let over: Vec<PeerId> = book
+        .banned
+        .iter()
+        .filter(|(_, since)| since.elapsed() >= BAN_DURATION)
+        .map(|(peer, _)| *peer)
+        .collect();
+    for peer in over {
+        book.banned.remove(&peer);
+        swarm.behaviour_mut().blocked.unblock_peer(peer);
+        info!(%peer, "ban lifted");
+    }
+}
+
 /// Ignores the gossip messages that wait longer than [`PENDING_TTL`] for a verdict, which
-/// frees their slots.
+/// frees their slots, and lifts the bans that are over.
 fn expire(swarm: &mut Swarm<Behaviour>, book: &mut Book) {
+    lift_bans(swarm, book);
     let stale: Vec<u64> = book
         .pending
         .iter()
@@ -726,6 +804,10 @@ async fn on_command(
             };
             report(swarm, &pending, acceptance);
         }
+        ToSwarm::Ban { peer } => match PeerId::from_bytes(&peer) {
+            Ok(peer) => ban(swarm, book, peer),
+            Err(error) => debug!(%error, "a ban for a peer id that does not parse"),
+        },
         ToSwarm::Disconnect { peer } => match PeerId::from_bytes(&peer) {
             Ok(peer) => {
                 if swarm.disconnect_peer_id(peer).is_err() {
@@ -919,6 +1001,16 @@ mod tests {
     }
 
     fn start_node(test: &str, name: &str, network: &str, bootnodes: Vec<String>) -> Node {
+        start_node_with(test, name, network, bootnodes, PeerLimits::default())
+    }
+
+    fn start_node_with(
+        test: &str,
+        name: &str,
+        network: &str,
+        bootnodes: Vec<String>,
+        limits: PeerLimits,
+    ) -> Node {
         let dir =
             std::env::temp_dir().join(format!("pouw-swarm-{}-{test}-{name}", std::process::id()));
         drop(fs::remove_dir_all(&dir));
@@ -927,7 +1019,7 @@ mod tests {
             network: NetworkName::try_from(network.to_owned()).unwrap(),
             listen: vec![format!("/ip4/127.0.0.1/tcp/{port}")],
             bootnodes,
-            limits: PeerLimits::default(),
+            limits,
             data_dir: dir.clone(),
         };
         let (wire, commands) = start(&config).unwrap();
@@ -1024,6 +1116,114 @@ mod tests {
     }
 
     const WAIT: Duration = Duration::from_secs(20);
+
+    #[test]
+    fn a_banned_peer_is_disconnected_and_does_not_come_back() {
+        let (mut a, mut b) = connected_pair("ban");
+        b.commands
+            .try_send(ToSwarm::Ban {
+                peer: a.peer.to_bytes(),
+            })
+            .unwrap();
+        let gone = wire_within(&mut b, WAIT, |message| match message {
+            Wire::PeerDisconnected(bytes) => Some(bytes),
+            _ => None,
+        });
+        assert_eq!(gone, Some(a.peer.to_bytes()));
+        // a dials its bootnode again every ten seconds while it has no peer, and b
+        // refuses the connection
+        assert_eq!(
+            connected_within(&mut b, Duration::from_secs(13), 1),
+            Vec::<PeerId>::new()
+        );
+        assert_eq!(
+            connected_within(&mut a, Duration::from_secs(1), 1),
+            Vec::<PeerId>::new()
+        );
+        clean(&[&a, &b]);
+    }
+
+    #[test]
+    fn a_node_takes_no_more_inbound_peers_than_its_limit() {
+        let one = PeerLimits {
+            max_inbound: 1,
+            ..PeerLimits::default()
+        };
+        let mut a = start_node_with("inbound", "a", "devnet", vec![], one);
+        let b = start_node("inbound", "b", "devnet", vec![a.addr.clone()]);
+        let c = start_node("inbound", "c", "devnet", vec![a.addr.clone()]);
+        let seen = connected_within(&mut a, Duration::from_secs(10), 2);
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(seen == [b.peer] || seen == [c.peer]);
+        clean(&[&a, &b, &c]);
+    }
+
+    /// `a` publishes `payload`, `b` (the only peer of `a`) gives its verdict on the message
+    /// it gets, and the result says whether `c` (a peer of `b` only) got the message too.
+    fn publish_and_judge(
+        a: &Node,
+        b: &mut Node,
+        c: &mut Node,
+        topic: &str,
+        payload: &[u8],
+        acceptance: Acceptance,
+    ) -> bool {
+        let publish = ToSwarm::Publish {
+            topic: topic.to_owned(),
+            bytes: payload.to_vec(),
+        };
+        a.commands.try_send(publish).unwrap();
+        let at_b = wire_within(b, Duration::from_millis(500), |message| match message {
+            Wire::Gossip { id, bytes, .. } => Some((id, bytes)),
+            _ => None,
+        });
+        if let Some((id, bytes)) = at_b {
+            assert_eq!(bytes, payload);
+            b.commands
+                .try_send(ToSwarm::Verdict { id, acceptance })
+                .unwrap();
+        }
+        wire_within(c, Duration::from_millis(500), |message| match message {
+            Wire::Gossip { bytes, .. } if bytes == payload => Some(()),
+            _ => None,
+        })
+        .is_some()
+    }
+
+    #[test]
+    fn a_message_the_node_rejects_is_not_relayed_and_one_it_accepts_is() {
+        // a line: `a` takes one inbound peer and dials nobody, so `c` reaches it only
+        // through `b`
+        let end = PeerLimits {
+            max_inbound: 1,
+            max_outbound: 0,
+            ..PeerLimits::default()
+        };
+        let a = start_node_with("relay", "a", "devnet", vec![], end);
+        let mut b = start_node("relay", "b", "devnet", vec![a.addr.clone()]);
+        let mut c = start_node("relay", "c", "devnet", vec![b.addr.clone()]);
+        let topic = coin_txs_topic();
+
+        // what b accepts reaches c, once the mesh of b has c in it
+        let mut relayed = false;
+        for _ in 0..40 {
+            relayed = publish_and_judge(&a, &mut b, &mut c, &topic, b"fine", Acceptance::Accept);
+            if relayed {
+                break;
+            }
+        }
+        assert!(
+            relayed,
+            "an accepted message did not reach the end of the line"
+        );
+
+        // what b rejects does not
+        for _ in 0..8 {
+            let leaked = publish_and_judge(&a, &mut b, &mut c, &topic, b"bad", Acceptance::Reject);
+            assert!(!leaked, "a rejected message was relayed");
+        }
+        clean(&[&a, &b, &c]);
+    }
 
     fn coin_txs_topic() -> String {
         protocol::protocol_id(
