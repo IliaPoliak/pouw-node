@@ -2,13 +2,13 @@
 //! peers from the store, and asking peers for headers and blocks. A request of the node
 //! is sent with a [`RequestId`] and kept in a table of pending requests until the
 //! transport answers it with that id. Headers-first initial block download is
-//! pouw-node#90, built on these requests in `node::on_headers`.
+//! pouw-node#90, built on these requests in `ibd::on_headers`.
 //!
 //! ```text
 //!  Status of a peer with more work   -> ask_headers   GetHeaders { our locator }
 //!  announce, parent not indexed      -> ask_headers
 //!  announce, parent indexed          -> chain::receive_header, ask_block id
-//!  Headers answer                    -> node::on_headers (pouw-node#90)
+//!  Headers answer                    -> ibd::on_headers (pouw-node#90)
 //!  Blocks answer                     -> chain pipeline, in order
 //! ```
 //!
@@ -210,13 +210,39 @@ pub fn ask_headers(
     metrics: &mut Metrics,
     peer: PeerIx,
 ) -> Result<Option<RequestId>, SyncError> {
+    ask_headers_from(network, pending, next_request, store, metrics, peer, None)
+}
+
+/// Like [`ask_headers`], with the header `after` ahead of our locator when it is given: the
+/// peer answers with the headers after it. Initial block download asks this way for
+/// the next page of headers, because the headers it stored are not on our canonical
+/// chain yet and our locator alone would bring the same page again. The locator keeps
+/// within [`MAX_LOCATOR_IDS`] ids: with `after` it drops our tip, which `after` is above.
+pub fn ask_headers_from(
+    network: &Network,
+    pending: &mut Pending,
+    next_request: &mut RequestId,
+    store: &Store,
+    metrics: &mut Metrics,
+    peer: PeerIx,
+    after: Option<BlockId>,
+) -> Result<Option<RequestId>, SyncError> {
     let waiting = pending.iter().any(|waiting| {
         waiting.peer == peer && matches!(waiting.request, SyncRequest::GetHeaders(_))
     });
     if waiting {
         return Ok(None);
     }
-    let locator = locator(&store::read(store)?)?;
+    let ours = locator(&store::read(store)?)?;
+    let locator = match after {
+        None => ours,
+        Some(after) => {
+            let skip = usize::from(ours.len() >= MAX_LOCATOR_IDS);
+            let mut ids = vec![after];
+            ids.extend(ours.into_iter().skip(skip));
+            ids
+        }
+    };
     let get = GetHeaders {
         locator,
         stop: None,
@@ -269,7 +295,7 @@ pub struct SyncedBlocks {
 pub enum SyncOutcome {
     /// Blocks for the chain pipeline.
     Blocks(SyncedBlocks),
-    /// Headers for `node::on_headers`.
+    /// Headers for `ibd::on_headers`.
     Headers {
         peer: PeerIx,
         headers: Vec<BlockHeader>,

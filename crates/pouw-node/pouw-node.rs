@@ -11,6 +11,7 @@ pub mod chain;
 pub mod config;
 pub mod events;
 pub mod http;
+pub mod ibd;
 pub mod mempool;
 pub mod metrics;
 pub mod miner;
