@@ -22,13 +22,17 @@ pub mod var {
     pub const DATA_DIR: &str = "POUW_LIGHT_DATA_DIR";
     /// Most recent headers kept in memory, at least 1. Default `1024`.
     pub const HEADER_CACHE: &str = "POUW_LIGHT_HEADER_CACHE";
+    /// Path of the chain spec the light node follows, the same file as the full
+    /// node reads. Default: the devnet spec of the repository.
+    pub const CHAIN_SPEC: &str = "POUW_CHAIN_SPEC";
 }
 
-const KNOWN: [&str; 4] = [
+const KNOWN: [&str; 5] = [
     var::API_ADDR,
     var::FULL_NODES,
     var::DATA_DIR,
     var::HEADER_CACHE,
+    var::CHAIN_SPEC,
 ];
 
 const DEFAULT_HEADER_CACHE: usize = 1024;
@@ -73,6 +77,8 @@ pub struct LightConfig {
     pub data_dir: PathBuf,
     /// Most recent headers kept in memory.
     pub header_cache: usize,
+    /// Chain spec file, `None` for the devnet spec.
+    pub chain_spec: Option<PathBuf>,
 }
 
 impl LightConfig {
@@ -91,12 +97,14 @@ impl LightConfig {
         let mut full_nodes = None;
         let mut data_dir = None;
         let mut header_cache = None;
+        let mut chain_spec = None;
         for (name, value) in vars {
             match name.as_str() {
                 var::API_ADDR => api_addr = Some(value),
                 var::FULL_NODES => full_nodes = Some(value),
                 var::DATA_DIR => data_dir = Some(value),
                 var::HEADER_CACHE => header_cache = Some(value),
+                var::CHAIN_SPEC => chain_spec = Some(PathBuf::from(value)),
                 other if other.starts_with("POUW_") && !KNOWN.contains(&other) => {
                     return Err(ConfigError::Unknown(name));
                 }
@@ -140,6 +148,7 @@ impl LightConfig {
             full_nodes,
             data_dir: PathBuf::from(data_dir.unwrap_or_else(|| "data".to_owned())),
             header_cache,
+            chain_spec,
         })
     }
 }
