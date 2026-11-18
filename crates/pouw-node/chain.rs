@@ -333,8 +333,7 @@ fn record_block(store: &Store, metrics: &mut Metrics, block: &Block) -> Result<(
     let secs = parent.map_or(0, |parent| {
         block.header.timestamp.get().saturating_sub(parent)
     });
-    metrics.blocks_connected = metrics.blocks_connected.saturating_add(1);
-    metrics.block_time_secs = metrics.block_time_secs.saturating_add(secs);
+    metrics.connected_block(secs);
     let proofs = u64::try_from(block.proof_txs.len()).unwrap_or(u64::MAX);
     metrics.block_proofs = metrics.block_proofs.saturating_add(proofs);
     Ok(())
