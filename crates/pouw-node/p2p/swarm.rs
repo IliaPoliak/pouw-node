@@ -16,6 +16,13 @@
 //!   entries. It is the peer list: a bootstrap query asks known peers for the peers
 //!   near the node, so peers that only know one bootnode find each other.
 //!
+//! - gossipsub (pouw-node#86), on the topics of [`subscriptions`]. A message that arrives
+//!   goes to the transport as [`Wire::Gossip`] under a number the swarm gives it, and is
+//!   relayed to other peers only after the verdict of the node comes back as
+//!   [`ToSwarm::Verdict`] of that number; until then it waits in a table of at most
+//!   `MAX_PENDING` entries, and a message that waits more than `PENDING_TTL` is
+//!   ignored. [`ToSwarm::Publish`] sends a message of the node to the peers of its topic.
+//!
 //! The channel is bounded and the swarm waits for a free slot before it reads the
 //! sockets again, as the module doc of [`p2p`](super) describes.
 //!
@@ -33,10 +40,10 @@
 //! The transport commands the swarm with [`ToSwarm`] on a second channel, which the
 //! transport fills with `try_send` and never waits on.
 //!
-//! Not built yet, each is a part of pouw-node#85 or a later task: gossipsub, the
-//! connection limits of [`PeerLimits`](super::PeerLimits) and the ban list.
+//! Not built yet, each is a part of a later task: the connection limits of
+//! [`PeerLimits`](super::PeerLimits) and the ban list.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{
     collections::{HashMap, HashSet},
     io,
@@ -47,7 +54,9 @@ use std::{
 
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, TransportError, identify,
+    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, TransportError,
+    gossipsub::{self, IdentTopic, MessageAcceptance},
+    identify,
     identity::Keypair,
     kad,
     multiaddr::Protocol,
@@ -69,11 +78,11 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use super::{
-    NetworkError, RequestId, SWARM_COMMAND_CAPACITY, ServeId, SwarmIn, ToSwarm, TransportConfig,
-    TransportFailure, WIRE_CAPACITY, Wire, WireIn,
+    Acceptance, MessageId, NetworkError, RequestId, SWARM_COMMAND_CAPACITY, ServeId, SwarmIn,
+    ToSwarm, TransportConfig, TransportFailure, WIRE_CAPACITY, Wire, WireIn,
     frames::FrameCodec,
     identity::{self, IdentityError},
-    protocol,
+    protocol, subscriptions,
 };
 
 /// Name of the identify protocol in a protocol id. The protocol id is also the
@@ -91,6 +100,18 @@ const REDIAL_INTERVAL: Duration = Duration::from_secs(10);
 /// protocols of the next tasks keep a connection busy, until then a long timeout keeps
 /// the peers connected.
 const IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_hours(1);
+
+/// How many gossip messages may wait for the verdict of the node at once. A message that
+/// arrives beyond it is ignored at once, so a peer cannot make the swarm hold more.
+const MAX_PENDING: usize = 1024;
+
+/// How long a gossip message waits for its verdict. After that it is ignored: the node
+/// dropped the verdict, the transport could not pass it on, or the message never reached
+/// the node.
+const PENDING_TTL: Duration = Duration::from_secs(30);
+
+/// How often the swarm looks for gossip messages that wait too long.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How long a `Status` waits for the empty answer that completes it.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -132,6 +153,8 @@ pub enum SwarmError {
         #[source]
         source: TransportError<io::Error>,
     },
+    #[error("cannot set up gossipsub: {0}")]
+    Gossipsub(String),
     #[error("the swarm thread ended before it was ready")]
     Gone,
 }
@@ -145,6 +168,18 @@ struct Behaviour {
     status: request_response::Behaviour<FrameCodec>,
     /// `SyncRequest` and `SyncResponse`.
     sync: request_response::Behaviour<FrameCodec>,
+    /// The messages of the topics of [`subscriptions`].
+    gossipsub: gossipsub::Behaviour,
+}
+
+/// A gossip message that waits for the verdict of the node.
+#[derive(Debug)]
+struct Pending {
+    /// The id gossipsub knows the message by.
+    id: gossipsub::MessageId,
+    /// The peer that sent it to us, which gossipsub needs to apply the verdict.
+    source: PeerId,
+    since: Instant,
 }
 
 /// What the swarm remembers between events.
@@ -164,6 +199,11 @@ struct Book {
     served_by: HashMap<InboundRequestId, ServeId>,
     /// The sync requests of the node that wait for an answer.
     asked: HashMap<OutboundRequestId, RequestId>,
+    /// The gossip messages that wait for a verdict, by the number the node knows them by.
+    /// Holds at most [`MAX_PENDING`] entries.
+    pending: HashMap<u64, Pending>,
+    /// The number of the next gossip message handed to the transport.
+    next_message: u64,
 }
 
 /// A sync request of a peer and the channel its answer goes back on.
@@ -284,6 +324,7 @@ fn build(config: &TransportConfig, keypair: Keypair) -> Result<Swarm<Behaviour>,
     let sync_protocol = stream_protocol(&config.network, protocol::SYNC)?;
     let bucket =
         NonZeroUsize::new(config.limits.kademlia_bucket_size).ok_or(SwarmError::BucketSize)?;
+    let gossipsub = build_gossipsub(config, &keypair)?;
     let agent = format!("pouw-node/{}", env!("CARGO_PKG_VERSION"));
     let Ok(builder) = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
@@ -330,11 +371,49 @@ fn build(config: &TransportConfig, keypair: Keypair) -> Result<Swarm<Behaviour>,
                     [(sync_protocol, ProtocolSupport::Full)],
                     sync_config,
                 ),
+                gossipsub,
             }
         });
     Ok(builder
         .with_swarm_config(|config| config.with_idle_connection_timeout(IDLE_CONNECTION_TIMEOUT))
         .build())
+}
+
+/// Gossipsub with the topics of [`subscriptions`], subscribed. The mesh degree is
+/// [`PeerLimits::mesh_d`](super::PeerLimits). Messages are signed and checked strictly,
+/// and `validate_messages` holds each received message back until the node's verdict.
+/// The size limit is the largest of the topics; the precheck of the transport enforces
+/// the limit of each topic.
+fn build_gossipsub(
+    config: &TransportConfig,
+    keypair: &Keypair,
+) -> Result<gossipsub::Behaviour, SwarmError> {
+    let topics = subscriptions(&config.network);
+    let largest = topics
+        .iter()
+        .map(|subscription| subscription.max_transmit_size)
+        .max()
+        .unwrap_or(0);
+    let mesh = usize::try_from(config.limits.mesh_d)
+        .map_err(|error| SwarmError::Gossipsub(error.to_string()))?;
+    let gossip_config = gossipsub::ConfigBuilder::default()
+        .validation_mode(gossipsub::ValidationMode::Strict)
+        .validate_messages()
+        .mesh_n(mesh)
+        .max_transmit_size(largest)
+        .build()
+        .map_err(|error| SwarmError::Gossipsub(error.to_string()))?;
+    let mut behaviour = gossipsub::Behaviour::new(
+        gossipsub::MessageAuthenticity::Signed(keypair.clone()),
+        gossip_config,
+    )
+    .map_err(|error| SwarmError::Gossipsub(error.to_string()))?;
+    for subscription in &topics {
+        behaviour
+            .subscribe(&IdentTopic::new(subscription.id.clone()))
+            .map_err(|error| SwarmError::Gossipsub(error.to_string()))?;
+    }
+    Ok(behaviour)
 }
 
 /// The libp2p name of the protocol `name` on `network`.
@@ -362,7 +441,8 @@ fn split_peer(addr: &Multiaddr) -> Option<(PeerId, Multiaddr)> {
 
 /// Handles the swarm events and the commands of the transport until the transport thread
 /// is gone. Dials the bootnodes at once and again every [`REDIAL_INTERVAL`] while no peer
-/// is connected.
+/// is connected, and every [`SWEEP_INTERVAL`] ignores the gossip messages that wait too
+/// long for a verdict.
 async fn drive(
     mut swarm: Swarm<Behaviour>,
     bootnodes: &[Multiaddr],
@@ -373,6 +453,8 @@ async fn drive(
     let mut book = Book::default();
     let mut redial = time::interval(REDIAL_INTERVAL);
     redial.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut sweep = time::interval(SWEEP_INTERVAL);
+    sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             event = swarm.select_next_some() => {
@@ -390,6 +472,7 @@ async fn drive(
                 }
             }
             _ = redial.tick() => dial_bootnodes(&mut swarm, bootnodes),
+            _ = sweep.tick() => expire(&mut swarm, &mut book),
         }
     }
 }
@@ -442,6 +525,13 @@ async fn on_event(
             is_new_peer,
             ..
         })) => debug!(%peer, is_new_peer, "routing table updated"),
+        SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
+            propagation_source,
+            message_id,
+            message,
+        })) => {
+            return on_gossip(swarm, book, propagation_source, message_id, message, wire).await;
+        }
         SwarmEvent::Behaviour(BehaviourEvent::Status(event)) => {
             return on_status(swarm, book, event, wire).await;
         }
@@ -451,6 +541,72 @@ async fn on_event(
         _ => {}
     }
     true
+}
+
+/// A gossip message arrived. It waits in the book under a new number, and the transport
+/// gets it as [`Wire::Gossip`]; gossipsub relays it after the verdict of the node. Beyond
+/// [`MAX_PENDING`] waiting messages a new one is ignored at once.
+async fn on_gossip(
+    swarm: &mut Swarm<Behaviour>,
+    book: &mut Book,
+    source: PeerId,
+    id: gossipsub::MessageId,
+    message: gossipsub::Message,
+    wire: &mpsc::Sender<Wire>,
+) -> bool {
+    let pending = Pending {
+        id,
+        source,
+        since: Instant::now(),
+    };
+    if book.pending.len() >= MAX_PENDING {
+        warn!(%source, "too many gossip messages wait for a verdict, ignoring one");
+        report(swarm, &pending, MessageAcceptance::Ignore);
+        return true;
+    }
+    if !report_peer(book, source, wire).await {
+        return false;
+    }
+    let number = book.next_message;
+    book.next_message = number.wrapping_add(1);
+    book.pending.insert(number, pending);
+    let message = Wire::Gossip {
+        id: MessageId(number),
+        topic: message.topic.into_string(),
+        from: source.to_bytes(),
+        bytes: message.data,
+    };
+    send(wire, message).await
+}
+
+/// Tells gossipsub what to do with a message that waited for a verdict: relay it
+/// (`Accept`), drop it (`Ignore`), or drop it and lower the score of its sender (`Reject`).
+fn report(swarm: &mut Swarm<Behaviour>, pending: &Pending, acceptance: MessageAcceptance) {
+    let outcome = swarm
+        .behaviour_mut()
+        .gossipsub
+        .report_message_validation_result(&pending.id, &pending.source, acceptance);
+    debug!(?outcome, id = %pending.id, "verdict passed to gossipsub");
+}
+
+/// Ignores the gossip messages that wait longer than [`PENDING_TTL`] for a verdict, which
+/// frees their slots.
+fn expire(swarm: &mut Swarm<Behaviour>, book: &mut Book) {
+    let stale: Vec<u64> = book
+        .pending
+        .iter()
+        .filter(|(_, pending)| pending.since.elapsed() > PENDING_TTL)
+        .map(|(number, _)| *number)
+        .collect();
+    for number in stale {
+        if let Some(pending) = book.pending.remove(&number) {
+            warn!(
+                number,
+                "no verdict on a gossip message in time, ignoring it"
+            );
+            report(swarm, &pending, MessageAcceptance::Ignore);
+        }
+    }
 }
 
 /// A peer told us who it is. A peer of another network is disconnected. A peer of this
@@ -548,6 +704,28 @@ async fn on_command(
             }
             Err(error) => debug!(%error, "a status for a peer id that does not parse"),
         },
+        ToSwarm::Publish { topic, bytes } => {
+            match swarm
+                .behaviour_mut()
+                .gossipsub
+                .publish(IdentTopic::new(topic), bytes)
+            {
+                Ok(id) => debug!(%id, "gossip message published"),
+                Err(error) => debug!(%error, "gossip message not published"),
+            }
+        }
+        ToSwarm::Verdict { id, acceptance } => {
+            let Some(pending) = book.pending.remove(&id.0) else {
+                debug!(?id, "verdict on a gossip message that is not waiting");
+                return true;
+            };
+            let acceptance = match acceptance {
+                Acceptance::Accept => MessageAcceptance::Accept,
+                Acceptance::Ignore => MessageAcceptance::Ignore,
+                Acceptance::Reject => MessageAcceptance::Reject,
+            };
+            report(swarm, &pending, acceptance);
+        }
         ToSwarm::Disconnect { peer } => match PeerId::from_bytes(&peer) {
             Ok(peer) => {
                 if swarm.disconnect_peer_id(peer).is_err() {
@@ -846,6 +1024,79 @@ mod tests {
     }
 
     const WAIT: Duration = Duration::from_secs(20);
+
+    fn coin_txs_topic() -> String {
+        protocol::protocol_id(
+            &NetworkName::try_from("devnet".to_owned()).unwrap(),
+            crate::p2p::Topic::CoinTxs.name(),
+        )
+    }
+
+    /// Publishes `payload` on `topic` from `from` until `to` receives it. The peers learn
+    /// each other's subscriptions a moment after they connect, and a message published
+    /// before that reaches nobody, so it is published again until one arrives.
+    fn publish_until_received(
+        from: &Node,
+        to: &mut Node,
+        topic: &str,
+        payload: &[u8],
+    ) -> (MessageId, String, Vec<u8>, Vec<u8>) {
+        for _ in 0..40 {
+            let publish = ToSwarm::Publish {
+                topic: topic.to_owned(),
+                bytes: payload.to_vec(),
+            };
+            from.commands.try_send(publish).unwrap();
+            let got = wire_within(to, Duration::from_millis(500), |message| match message {
+                Wire::Gossip {
+                    id,
+                    topic,
+                    from,
+                    bytes,
+                } => Some((id, topic, from, bytes)),
+                _ => None,
+            });
+            if let Some(got) = got {
+                return got;
+            }
+        }
+        panic!("the message did not arrive");
+    }
+
+    #[test]
+    fn a_published_message_reaches_the_peer_and_waits_for_its_verdict() {
+        let (a, mut b) = connected_pair("gossip");
+        let topic = coin_txs_topic();
+        let payload = b"a transaction".to_vec();
+        let (id, got_topic, from, bytes) = publish_until_received(&a, &mut b, &topic, &payload);
+        assert_eq!(got_topic, topic);
+        assert_eq!(from, a.peer.to_bytes());
+        assert_eq!(bytes, payload);
+        b.commands
+            .try_send(ToSwarm::Verdict {
+                id,
+                acceptance: Acceptance::Accept,
+            })
+            .unwrap();
+        // a verdict on a number that is not waiting changes nothing
+        b.commands
+            .try_send(ToSwarm::Verdict {
+                id: MessageId(u64::MAX),
+                acceptance: Acceptance::Reject,
+            })
+            .unwrap();
+        clean(&[&a, &b]);
+    }
+
+    #[test]
+    fn every_message_gets_a_number_of_its_own() {
+        let (a, mut b) = connected_pair("numbers");
+        let topic = coin_txs_topic();
+        let (first, ..) = publish_until_received(&a, &mut b, &topic, b"one");
+        let (second, ..) = publish_until_received(&a, &mut b, &topic, b"two");
+        assert_ne!(first, second);
+        clean(&[&a, &b]);
+    }
 
     #[test]
     fn a_status_and_a_sync_exchange_cross_between_two_swarms() {
