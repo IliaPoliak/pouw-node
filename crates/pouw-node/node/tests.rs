@@ -2186,3 +2186,107 @@ fn the_circuits_of_a_rocksdb_store_are_listed_by_registration_and_survive_a_rest
     let reopened = open();
     assert_eq!(listed(&reopened), expected);
 }
+
+// Two nodes, each with its own transport thread and libp2p swarm on 127.0.0.1
+// (pouw-node#86): what one node pools and broadcasts, the other pools.
+
+/// A port nothing listens on at the moment.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Starts the transport of `h` on its own thread, listening on `port` and dialing
+/// `bootnodes`, and returns the directory of its key. The transport takes the commands
+/// of the node from now on.
+fn start_transport(
+    h: &mut Harness,
+    name: &str,
+    port: u16,
+    bootnodes: Vec<String>,
+) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("pouw-two-nodes-{}-{name}", std::process::id()));
+    drop(std::fs::remove_dir_all(&dir));
+    let config = crate::p2p::TransportConfig {
+        network: pouw_types::NetworkName::try_from("devnet".to_owned()).unwrap(),
+        listen: vec![format!("/ip4/127.0.0.1/tcp/{port}")],
+        bootnodes,
+        limits: crate::p2p::PeerLimits::default(),
+        data_dir: dir.clone(),
+    };
+    let (_, unused) = mpsc::channel(1);
+    let outbound = std::mem::replace(&mut h.outbound, unused);
+    let inbound = h.feeds.p2p.clone();
+    std::thread::spawn(move || {
+        drop(crate::p2p::run_transport(
+            &config,
+            &test_params(),
+            outbound,
+            &inbound,
+        ));
+    });
+    dir
+}
+
+#[test]
+fn a_transaction_submitted_to_one_node_reaches_the_mempool_of_another() {
+    let mut a = harness();
+    let mut b = harness();
+    with_genesis(&mut a);
+    with_genesis(&mut b);
+    let port = free_port();
+    let dir_a = start_transport(&mut a, "a", port, vec![]);
+    let dir_b = start_transport(
+        &mut b,
+        "b",
+        free_port(),
+        vec![format!("/ip4/127.0.0.1/tcp/{port}")],
+    );
+
+    // The peers learn each other's topics a moment after they connect, and a message
+    // published before that reaches nobody. So a new transaction goes to the first node
+    // every half second (each from a sender of its own, so none is refused as a
+    // duplicate or for lack of slots) until the second node has one.
+    let start = std::time::Instant::now();
+    let mut sent = Vec::new();
+    let mut replies = Vec::new();
+    let mut seed = 0u8;
+    let mut last = None::<std::time::Instant>;
+    while b.state.mempool.txs.is_empty() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "no transaction reached the second node, {} were sent",
+            sent.len()
+        );
+        if last.is_none_or(|at| at.elapsed() >= Duration::from_millis(500)) {
+            let tx = transfer_from(seed, CHAIN, 0);
+            seed = seed.wrapping_add(1);
+            let (reply, answer) = oneshot::channel();
+            let checked = submitted(tx.clone());
+            to_api(&a, ApiRequest::SubmitTx { checked, reply });
+            sent.push(tx);
+            replies.push(answer);
+            last = Some(std::time::Instant::now());
+        }
+        run(&mut a);
+        run(&mut b);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let arrived = sent
+        .iter()
+        .filter(|tx| mempool::get(&b.state.mempool, &txid(tx)).is_some())
+        .count();
+    assert!(
+        arrived >= 1,
+        "the pool of the second node holds no sent transaction"
+    );
+    // the first node keeps what it was sent
+    assert!(a.state.mempool.txs.len() >= arrived);
+    assert_eq!(a.state.metrics.dropped_commands, 0);
+    assert_eq!(b.state.metrics.dropped_commands, 0);
+    drop(std::fs::remove_dir_all(dir_a));
+    drop(std::fs::remove_dir_all(dir_b));
+}
