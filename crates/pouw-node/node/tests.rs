@@ -2511,6 +2511,7 @@ fn headers_of_a_peer_that_ignored_our_locator_are_reported() {
     to_node(&h, Inbound::Response { id, result });
     run(&mut h);
     assert_eq!(reports(&mut h), [(peer(), Misbehavior::InvalidBlock)]);
+}
 
 // Two nodes, each with its own transport thread and libp2p swarm on 127.0.0.1
 // (pouw-node#86): what one node pools and broadcasts, the other pools.
