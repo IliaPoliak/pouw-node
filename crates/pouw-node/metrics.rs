@@ -2,13 +2,14 @@
 //! list belongs to the metrics contract. The node loop owns one [`Metrics`], its
 //! handlers update it and [`render`] writes it in the text exposition format.
 //! [`DROPPED_REPLIES`], [`DROPPED_COMMANDS`] and [`DROPPED_BLOCKS`] are the metrics beyond
-//! the contract.
+//! the contract, as are the network metrics [`MESSAGES_RECEIVED`], [`MESSAGES_SENT`] and
+//! [`BLOCK_RECEIVE_DELAY_SECONDS`] (next to [`PEERS`]).
 
 use std::{net::SocketAddr, time::Duration};
 
 use tokio::sync::mpsc;
 
-use crate::{api::ApiRequest, node::ComponentFault};
+use crate::{api::ApiRequest, node::ComponentFault, p2p::Topic};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricKind {
@@ -108,6 +109,98 @@ pub const LOTTERY_ATTEMPTS: Metric = Metric {
     kind: MetricKind::Counter,
 };
 
+/// What a message between two nodes is, the label `kind` of [`MESSAGES_RECEIVED`] and
+/// [`MESSAGES_SENT`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageKind {
+    /// A block announcement on the gossip topic of blocks.
+    BlockAnnounce,
+    /// A transfer or a circuit registration on the gossip topic of coin transactions.
+    CoinTx,
+    /// A proof request on the gossip topic of proof requests.
+    ProofRequest,
+    /// The status a peer sends once after it connects.
+    Status,
+    /// A `GetHeaders` or a `GetBlocks`.
+    SyncRequest,
+    /// The answer to a [`MessageKind::SyncRequest`].
+    SyncResponse,
+}
+
+/// How many [`MessageKind`]s there are.
+pub const MESSAGE_KINDS: usize = 6;
+
+impl MessageKind {
+    pub const ALL: [Self; MESSAGE_KINDS] = [
+        Self::BlockAnnounce,
+        Self::CoinTx,
+        Self::ProofRequest,
+        Self::Status,
+        Self::SyncRequest,
+        Self::SyncResponse,
+    ];
+
+    /// The value of the label `kind`.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::BlockAnnounce => "block_announce",
+            Self::CoinTx => "coin_tx",
+            Self::ProofRequest => "proof_request",
+            Self::Status => "status",
+            Self::SyncRequest => "sync_request",
+            Self::SyncResponse => "sync_response",
+        }
+    }
+
+    /// The place of the kind in [`MessageKind::ALL`].
+    pub const fn index(self) -> usize {
+        match self {
+            Self::BlockAnnounce => 0,
+            Self::CoinTx => 1,
+            Self::ProofRequest => 2,
+            Self::Status => 3,
+            Self::SyncRequest => 4,
+            Self::SyncResponse => 5,
+        }
+    }
+
+    /// The kind of a gossip message on `topic`.
+    pub const fn of_topic(topic: Topic) -> Self {
+        match topic {
+            Topic::BlockAnnounce => Self::BlockAnnounce,
+            Topic::CoinTxs => Self::CoinTx,
+            Topic::ProofRequests => Self::ProofRequest,
+        }
+    }
+}
+
+/// Messages received from peers and handed to the loop, by kind. A sync answer counts
+/// when it passed the precheck of the transport; one that failed does not.
+pub const MESSAGES_RECEIVED: Metric = Metric {
+    name: "pouw_node_messages_received_total",
+    help: "Messages received from peers, by kind.",
+    kind: MetricKind::Counter,
+};
+
+/// Messages the loop handed to the transport to send, by kind. A broadcast counts once,
+/// however many peers the transport sends it to.
+pub const MESSAGES_SENT: Metric = Metric {
+    name: "pouw_node_messages_sent_total",
+    help: "Messages handed to the transport to send, by kind.",
+    kind: MetricKind::Counter,
+};
+
+/// Seconds between the header timestamp of a block a peer announces and the moment the
+/// announcement arrives, for the first announcement of a block that passes the header
+/// rules. The timestamp is set by the miner before it seals the block, and the clocks of
+/// two nodes differ, so this is an upper bound of the delay in the network with the
+/// mining time and the clock skew in it; a negative value counts as 0.
+pub const BLOCK_RECEIVE_DELAY_SECONDS: Metric = Metric {
+    name: "pouw_node_block_receive_delay_seconds",
+    help: "Seconds between the header timestamp of an announced block and its arrival.",
+    kind: MetricKind::Histogram,
+};
+
 /// The metrics every node exports.
 pub const REQUIRED: [Metric; 4] = [HEIGHT, MEMPOOL_SIZE, PEERS, VERIFICATION_DURATION_SECONDS];
 
@@ -138,6 +231,43 @@ pub struct Metrics {
     pub block_time_secs: u64,
     /// [`LOTTERY_ATTEMPTS`].
     pub lottery_attempts: u64,
+    /// [`MESSAGES_RECEIVED`], by [`MessageKind::index`].
+    pub messages_received: [u64; MESSAGE_KINDS],
+    /// [`MESSAGES_SENT`], by [`MessageKind::index`].
+    pub messages_sent: [u64; MESSAGE_KINDS],
+    /// Count of [`BLOCK_RECEIVE_DELAY_SECONDS`].
+    pub block_delays: u64,
+    /// Sum of [`BLOCK_RECEIVE_DELAY_SECONDS`] in seconds.
+    pub block_delay_secs: u64,
+}
+
+impl Metrics {
+    /// Counts a message of `kind` received.
+    pub fn received(&mut self, kind: MessageKind) {
+        if let Some(count) = self.messages_received.get_mut(kind.index()) {
+            *count = count.saturating_add(1);
+        }
+    }
+
+    /// Counts a message of `kind` handed to the transport.
+    pub fn sent(&mut self, kind: MessageKind) {
+        if let Some(count) = self.messages_sent.get_mut(kind.index()) {
+            *count = count.saturating_add(1);
+        }
+    }
+
+    /// How many messages of `kind` were received.
+    pub fn received_of(&self, kind: MessageKind) -> u64 {
+        self.messages_received
+            .get(kind.index())
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// How many messages of `kind` were handed to the transport.
+    pub fn sent_of(&self, kind: MessageKind) -> u64 {
+        self.messages_sent.get(kind.index()).copied().unwrap_or(0)
+    }
 }
 
 /// The text exposition of every metric of [`REQUIRED`], [`DROPPED_REPLIES`],
@@ -172,6 +302,35 @@ pub fn render(metrics: &Metrics) -> String {
         name = metric.name,
         count = metrics.blocks_connected,
         sum = metrics.block_time_secs,
+    ));
+    for (metric, counts) in [
+        (MESSAGES_RECEIVED, &metrics.messages_received),
+        (MESSAGES_SENT, &metrics.messages_sent),
+    ] {
+        let lines: String = MessageKind::ALL
+            .into_iter()
+            .zip(counts)
+            .map(|(kind, count)| {
+                [
+                    metric.name,
+                    "{kind=\"",
+                    kind.label(),
+                    "\"} ",
+                    &count.to_string(),
+                    "\n",
+                ]
+                .concat()
+            })
+            .collect();
+        sections.push(format!("{}{lines}", header(metric)));
+    }
+    let metric = BLOCK_RECEIVE_DELAY_SECONDS;
+    sections.push(format!(
+        "{header}{name}_bucket{{le=\"+Inf\"}} {count}\n{name}_sum {sum}\n{name}_count {count}\n",
+        header = header(metric),
+        name = metric.name,
+        count = metrics.block_delays,
+        sum = metrics.block_delay_secs,
     ));
     sections.concat()
 }
@@ -237,6 +396,35 @@ mod tests {
         assert!(text.contains("# TYPE pouw_node_block_time_seconds histogram\n"));
         assert!(text.contains("pouw_node_block_time_seconds_sum 40\n"));
         assert!(text.contains("pouw_node_block_time_seconds_count 4\n"));
+    }
+
+    #[test]
+    fn the_network_metrics_are_rendered_by_kind() {
+        let mut metrics = Metrics {
+            block_delays: 2,
+            block_delay_secs: 9,
+            ..Metrics::default()
+        };
+        metrics.received(MessageKind::CoinTx);
+        metrics.received(MessageKind::CoinTx);
+        metrics.sent(MessageKind::SyncResponse);
+        assert_eq!(metrics.received_of(MessageKind::CoinTx), 2);
+        assert_eq!(metrics.received_of(MessageKind::Status), 0);
+        assert_eq!(metrics.sent_of(MessageKind::SyncResponse), 1);
+        let text = render(&metrics);
+        assert!(text.contains("# TYPE pouw_node_messages_received_total counter\n"));
+        assert!(text.contains("pouw_node_messages_received_total{kind=\"coin_tx\"} 2\n"));
+        assert!(text.contains("pouw_node_messages_received_total{kind=\"status\"} 0\n"));
+        assert!(text.contains("pouw_node_messages_sent_total{kind=\"sync_response\"} 1\n"));
+        assert!(text.contains("# TYPE pouw_node_block_receive_delay_seconds histogram\n"));
+        assert!(text.contains("pouw_node_block_receive_delay_seconds_sum 9\n"));
+        assert!(text.contains("pouw_node_block_receive_delay_seconds_count 2\n"));
+        // every kind has a line of its own, in the order of ALL
+        for (place, kind) in MessageKind::ALL.into_iter().enumerate() {
+            assert_eq!(kind.index(), place);
+            let line = format!("pouw_node_messages_sent_total{{kind=\"{}\"}}", kind.label());
+            assert_eq!(text.matches(&line).count(), 1);
+        }
     }
 
     #[test]

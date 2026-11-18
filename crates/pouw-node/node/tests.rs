@@ -2290,3 +2290,125 @@ fn a_transaction_submitted_to_one_node_reaches_the_mempool_of_another() {
     drop(std::fs::remove_dir_all(dir_a));
     drop(std::fs::remove_dir_all(dir_b));
 }
+
+// Network metrics (pouw-node#87).
+
+use crate::metrics::MessageKind;
+
+#[test]
+fn messages_are_counted_by_kind_when_they_come_and_when_they_go() {
+    let mut h = harness();
+    let genesis = with_genesis(&mut h);
+    let child = block(&genesis, vec![]);
+    gossip(&mut h, Gossip::Tx(Box::new(checked_tx(transfer(CHAIN, 0)))));
+    announce(&mut h, child.header);
+    status_from_peer(&h, status_of(&h));
+    to_node(
+        &h,
+        Inbound::Request {
+            from: peer(),
+            serve: ServeId(0),
+            request: SyncRequest::GetBlocks(GetBlocks { ids: vec![] }),
+        },
+    );
+    deliver(&mut h, &child);
+    run(&mut h);
+
+    let metrics = &h.state.metrics;
+    for (kind, want) in [
+        (MessageKind::CoinTx, 1),
+        (MessageKind::BlockAnnounce, 1),
+        (MessageKind::ProofRequest, 0),
+        (MessageKind::Status, 1),
+        (MessageKind::SyncRequest, 1),
+        (MessageKind::SyncResponse, 1),
+    ] {
+        assert_eq!(metrics.received_of(kind), want, "{kind:?}");
+    }
+
+    // what went out is what the commands say: a request for the announced block and the
+    // answer to the request of the peer
+    let commands = drain(&mut h);
+    let count = |pick: fn(&Command) -> bool| {
+        u64::try_from(commands.iter().filter(|command| pick(command)).count()).unwrap()
+    };
+    let requests = count(|command| matches!(command, Command::Request { .. }));
+    let answers = count(|command| matches!(command, Command::Answer { .. }));
+    assert!(requests >= 1 && answers == 1, "{commands:?}");
+    assert_eq!(h.state.metrics.sent_of(MessageKind::SyncRequest), requests);
+    assert_eq!(h.state.metrics.sent_of(MessageKind::SyncResponse), answers);
+}
+
+#[test]
+fn a_status_and_a_broadcast_of_the_node_are_counted_when_it_sends_them() {
+    let mut h = harness();
+    with_genesis(&mut h);
+    to_node(
+        &h,
+        Inbound::PeerConnected {
+            peer: peer(),
+            peer_id: "70".into(),
+        },
+    );
+    let (reply, mut answer) = oneshot::channel();
+    let checked = submitted(transfer(CHAIN, 0));
+    to_api(&h, ApiRequest::SubmitTx { checked, reply });
+    run(&mut h);
+    assert!(matches!(answer.try_recv(), Ok(TxOutcome::Pooled(_))));
+    let metrics = &h.state.metrics;
+    assert_eq!(metrics.peers, 1);
+    for (kind, want) in [
+        (MessageKind::Status, 1),
+        (MessageKind::CoinTx, 1),
+        (MessageKind::BlockAnnounce, 0),
+        (MessageKind::ProofRequest, 0),
+        (MessageKind::SyncRequest, 0),
+        (MessageKind::SyncResponse, 0),
+    ] {
+        assert_eq!(metrics.sent_of(kind), want, "{kind:?}");
+    }
+}
+
+#[test]
+fn a_command_the_full_channel_dropped_is_not_counted_as_sent() {
+    let mut h = harness();
+    with_genesis(&mut h);
+    let capacity = node::COMMAND_CAPACITY;
+    let filled = u64::try_from(capacity).unwrap();
+    for _ in 0..capacity {
+        let status = Box::new(node::our_status(&h.state).unwrap());
+        let command = Command::Status {
+            peer: peer(),
+            status,
+        };
+        crate::p2p::send(&h.state.network, command, &mut h.state.metrics).unwrap();
+    }
+    assert_eq!(h.state.metrics.sent_of(MessageKind::Status), filled);
+    let status = Box::new(node::our_status(&h.state).unwrap());
+    let command = Command::Status {
+        peer: peer(),
+        status,
+    };
+    crate::p2p::send(&h.state.network, command, &mut h.state.metrics).unwrap();
+    assert_eq!(h.state.metrics.sent_of(MessageKind::Status), filled);
+    assert_eq!(h.state.metrics.dropped_commands, 1);
+}
+
+#[test]
+fn the_delay_of_an_announced_block_is_its_age_when_the_announcement_arrives() {
+    let mut h = harness();
+    let genesis = with_genesis(&mut h);
+    let child = block(&genesis, vec![]);
+    set_clock(child.header.timestamp.get().saturating_add(7));
+    announce(&mut h, child.header);
+    // the same announcement again is known and not counted
+    announce(&mut h, child.header);
+    run(&mut h);
+    assert_eq!(
+        (
+            h.state.metrics.block_delays,
+            h.state.metrics.block_delay_secs
+        ),
+        (1, 7)
+    );
+}

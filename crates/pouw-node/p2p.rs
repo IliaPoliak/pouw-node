@@ -34,7 +34,7 @@ use tokio::{runtime, sync::mpsc};
 use tracing::{debug, info, warn};
 
 use crate::{
-    metrics::Metrics,
+    metrics::{MessageKind, Metrics},
     node::ComponentFault,
     precheck::{self, CheckedAnnounce, CheckedTx, Fetched, PrecheckError},
 };
@@ -491,14 +491,31 @@ pub fn send(
     command: Command,
     metrics: &mut Metrics,
 ) -> Result<Delivery, TransportGone> {
+    let kind = sent_kind(&command);
     match network.try_send(command) {
-        Ok(()) => Ok(Delivery::Queued),
+        Ok(()) => {
+            if let Some(kind) = kind {
+                metrics.sent(kind);
+            }
+            Ok(Delivery::Queued)
+        }
         Err(mpsc::error::TrySendError::Full(command)) => {
             metrics.dropped_commands = metrics.dropped_commands.saturating_add(1);
             warn!(?command, "command channel full, command dropped");
             Ok(Delivery::Dropped)
         }
         Err(mpsc::error::TrySendError::Closed(_)) => Err(TransportGone),
+    }
+}
+
+/// The kind of message a command makes the transport send, if it makes one.
+fn sent_kind(command: &Command) -> Option<MessageKind> {
+    match command {
+        Command::Request { .. } => Some(MessageKind::SyncRequest),
+        Command::Answer { .. } => Some(MessageKind::SyncResponse),
+        Command::Status { .. } => Some(MessageKind::Status),
+        Command::Broadcast(message) => Some(MessageKind::of_topic(message.topic())),
+        Command::Report(..) | Command::Validate { .. } | Command::Disconnect { .. } => None,
     }
 }
 
