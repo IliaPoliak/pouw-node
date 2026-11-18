@@ -2511,4 +2511,229 @@ fn headers_of_a_peer_that_ignored_our_locator_are_reported() {
     to_node(&h, Inbound::Response { id, result });
     run(&mut h);
     assert_eq!(reports(&mut h), [(peer(), Misbehavior::InvalidBlock)]);
+
+// Two nodes, each with its own transport thread and libp2p swarm on 127.0.0.1
+// (pouw-node#86): what one node pools and broadcasts, the other pools.
+
+/// A port nothing listens on at the moment.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Starts the transport of `h` on its own thread, listening on `port` and dialing
+/// `bootnodes`, and returns the directory of its key. The transport takes the commands
+/// of the node from now on.
+fn start_transport(
+    h: &mut Harness,
+    name: &str,
+    port: u16,
+    bootnodes: Vec<String>,
+) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("pouw-two-nodes-{}-{name}", std::process::id()));
+    drop(std::fs::remove_dir_all(&dir));
+    let config = crate::p2p::TransportConfig {
+        network: pouw_types::NetworkName::try_from("devnet".to_owned()).unwrap(),
+        listen: vec![format!("/ip4/127.0.0.1/tcp/{port}")],
+        bootnodes,
+        limits: crate::p2p::PeerLimits::default(),
+        data_dir: dir.clone(),
+    };
+    let (_, unused) = mpsc::channel(1);
+    let outbound = std::mem::replace(&mut h.outbound, unused);
+    let inbound = h.feeds.p2p.clone();
+    std::thread::spawn(move || {
+        drop(crate::p2p::run_transport(
+            &config,
+            &test_params(),
+            outbound,
+            &inbound,
+        ));
+    });
+    dir
+}
+
+#[test]
+fn a_transaction_submitted_to_one_node_reaches_the_mempool_of_another() {
+    let mut a = harness();
+    let mut b = harness();
+    with_genesis(&mut a);
+    with_genesis(&mut b);
+    let port = free_port();
+    let dir_a = start_transport(&mut a, "a", port, vec![]);
+    let dir_b = start_transport(
+        &mut b,
+        "b",
+        free_port(),
+        vec![format!("/ip4/127.0.0.1/tcp/{port}")],
+    );
+
+    // The peers learn each other's topics a moment after they connect, and a message
+    // published before that reaches nobody. So a new transaction goes to the first node
+    // every half second (each from a sender of its own, so none is refused as a
+    // duplicate or for lack of slots) until the second node has one.
+    let start = std::time::Instant::now();
+    let mut sent = Vec::new();
+    let mut replies = Vec::new();
+    let mut seed = 0u8;
+    let mut last = None::<std::time::Instant>;
+    while b.state.mempool.txs.is_empty() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "no transaction reached the second node, {} were sent",
+            sent.len()
+        );
+        if last.is_none_or(|at| at.elapsed() >= Duration::from_millis(500)) {
+            let tx = transfer_from(seed, CHAIN, 0);
+            seed = seed.wrapping_add(1);
+            let (reply, answer) = oneshot::channel();
+            let checked = submitted(tx.clone());
+            to_api(&a, ApiRequest::SubmitTx { checked, reply });
+            sent.push(tx);
+            replies.push(answer);
+            last = Some(std::time::Instant::now());
+        }
+        run(&mut a);
+        run(&mut b);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let arrived = sent
+        .iter()
+        .filter(|tx| mempool::get(&b.state.mempool, &txid(tx)).is_some())
+        .count();
+    assert!(
+        arrived >= 1,
+        "the pool of the second node holds no sent transaction"
+    );
+    // the first node keeps what it was sent
+    assert!(a.state.mempool.txs.len() >= arrived);
+    assert_eq!(a.state.metrics.dropped_commands, 0);
+    assert_eq!(b.state.metrics.dropped_commands, 0);
+    drop(std::fs::remove_dir_all(dir_a));
+    drop(std::fs::remove_dir_all(dir_b));
+}
+
+// Network metrics (pouw-node#87).
+
+use crate::metrics::MessageKind;
+
+#[test]
+fn messages_are_counted_by_kind_when_they_come_and_when_they_go() {
+    let mut h = harness();
+    let genesis = with_genesis(&mut h);
+    let child = block(&genesis, vec![]);
+    gossip(&mut h, Gossip::Tx(Box::new(checked_tx(transfer(CHAIN, 0)))));
+    announce(&mut h, child.header);
+    status_from_peer(&h, status_of(&h));
+    to_node(
+        &h,
+        Inbound::Request {
+            from: peer(),
+            serve: ServeId(0),
+            request: SyncRequest::GetBlocks(GetBlocks { ids: vec![] }),
+        },
+    );
+    deliver(&mut h, &child);
+    run(&mut h);
+
+    let metrics = &h.state.metrics;
+    for (kind, want) in [
+        (MessageKind::CoinTx, 1),
+        (MessageKind::BlockAnnounce, 1),
+        (MessageKind::ProofRequest, 0),
+        (MessageKind::Status, 1),
+        (MessageKind::SyncRequest, 1),
+        (MessageKind::SyncResponse, 1),
+    ] {
+        assert_eq!(metrics.received_of(kind), want, "{kind:?}");
+    }
+
+    // what went out is what the commands say: a request for the announced block and the
+    // answer to the request of the peer
+    let commands = drain(&mut h);
+    let count = |pick: fn(&Command) -> bool| {
+        u64::try_from(commands.iter().filter(|command| pick(command)).count()).unwrap()
+    };
+    let requests = count(|command| matches!(command, Command::Request { .. }));
+    let answers = count(|command| matches!(command, Command::Answer { .. }));
+    assert!(requests >= 1 && answers == 1, "{commands:?}");
+    assert_eq!(h.state.metrics.sent_of(MessageKind::SyncRequest), requests);
+    assert_eq!(h.state.metrics.sent_of(MessageKind::SyncResponse), answers);
+}
+
+#[test]
+fn a_status_and_a_broadcast_of_the_node_are_counted_when_it_sends_them() {
+    let mut h = harness();
+    with_genesis(&mut h);
+    to_node(
+        &h,
+        Inbound::PeerConnected {
+            peer: peer(),
+            peer_id: "70".into(),
+        },
+    );
+    let (reply, mut answer) = oneshot::channel();
+    let checked = submitted(transfer(CHAIN, 0));
+    to_api(&h, ApiRequest::SubmitTx { checked, reply });
+    run(&mut h);
+    assert!(matches!(answer.try_recv(), Ok(TxOutcome::Pooled(_))));
+    let metrics = &h.state.metrics;
+    assert_eq!(metrics.peers, 1);
+    for (kind, want) in [
+        (MessageKind::Status, 1),
+        (MessageKind::CoinTx, 1),
+        (MessageKind::BlockAnnounce, 0),
+        (MessageKind::ProofRequest, 0),
+        (MessageKind::SyncRequest, 0),
+        (MessageKind::SyncResponse, 0),
+    ] {
+        assert_eq!(metrics.sent_of(kind), want, "{kind:?}");
+    }
+}
+
+#[test]
+fn a_command_the_full_channel_dropped_is_not_counted_as_sent() {
+    let mut h = harness();
+    with_genesis(&mut h);
+    let capacity = node::COMMAND_CAPACITY;
+    let filled = u64::try_from(capacity).unwrap();
+    for _ in 0..capacity {
+        let status = Box::new(node::our_status(&h.state).unwrap());
+        let command = Command::Status {
+            peer: peer(),
+            status,
+        };
+        crate::p2p::send(&h.state.network, command, &mut h.state.metrics).unwrap();
+    }
+    assert_eq!(h.state.metrics.sent_of(MessageKind::Status), filled);
+    let status = Box::new(node::our_status(&h.state).unwrap());
+    let command = Command::Status {
+        peer: peer(),
+        status,
+    };
+    crate::p2p::send(&h.state.network, command, &mut h.state.metrics).unwrap();
+    assert_eq!(h.state.metrics.sent_of(MessageKind::Status), filled);
+    assert_eq!(h.state.metrics.dropped_commands, 1);
+}
+
+#[test]
+fn the_delay_of_an_announced_block_is_its_age_when_the_announcement_arrives() {
+    let mut h = harness();
+    let genesis = with_genesis(&mut h);
+    let child = block(&genesis, vec![]);
+    set_clock(child.header.timestamp.get().saturating_add(7));
+    announce(&mut h, child.header);
+    // the same announcement again is known and not counted
+    announce(&mut h, child.header);
+    run(&mut h);
+    assert_eq!(
+        (
+            h.state.metrics.block_delays,
+            h.state.metrics.block_delay_secs
+        ),
+        (1, 7)
+    );
 }

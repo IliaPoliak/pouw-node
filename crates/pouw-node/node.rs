@@ -93,7 +93,7 @@ use crate::{
     events::{self, EventLog, SeqExhausted},
     ibd::{self, Ibd},
     mempool::{self, Mempool},
-    metrics::{self, Metrics},
+    metrics::{self, MessageKind, Metrics},
     miner::{self, InFlight, Work, WorkDone},
     p2p::{
         self, Acceptance, Command, Gossip, Inbound, MessageId, Misbehavior, Network, NetworkError,
@@ -422,11 +422,20 @@ pub fn handle(state: &mut NodeState, event: Event) -> Result<Flow, NodeFault> {
         Event::Net(Inbound::Gossip { id, from, message }) => {
             on_gossip(state, id, from, message)?;
         }
-        Event::Net(Inbound::Status { from, status }) => on_status(state, from, &status)?,
+        Event::Net(Inbound::Status { from, status }) => {
+            state.metrics.received(MessageKind::Status);
+            on_status(state, from, &status)?;
+        }
         Event::Net(Inbound::Request { serve, request, .. }) => {
+            state.metrics.received(MessageKind::SyncRequest);
             on_request(state, serve, &request)?;
         }
-        Event::Net(Inbound::Response { id, result }) => on_response(state, id, result)?,
+        Event::Net(Inbound::Response { id, result }) => {
+            if result.is_ok() {
+                state.metrics.received(MessageKind::SyncResponse);
+            }
+            on_response(state, id, result)?;
+        }
         Event::Net(Inbound::PeerConnected { peer, peer_id }) => {
             on_peer_connected(state, peer, &peer_id)?;
         }
@@ -587,6 +596,7 @@ fn on_gossip(
     message: Gossip,
 ) -> Result<(), NodeFault> {
     let topic = message.topic();
+    state.metrics.received(MessageKind::of_topic(topic));
     let acceptance = match message {
         Gossip::Tx(tx) => {
             let outcome = chain::receive_tx(
@@ -626,9 +636,13 @@ fn on_announce(
     announce: &CheckedAnnounce,
 ) -> Result<Acceptance, NodeFault> {
     let CheckedAnnounce { header, id } = announce;
-    match chain::receive_header(&mut state.store, &state.params, (state.clock)(), id, header)? {
+    let now = (state.clock)();
+    match chain::receive_header(&mut state.store, &state.params, now, id, header)? {
         HeaderOutcome::Known => Ok(Acceptance::Ignore),
         HeaderOutcome::Stored(_) => {
+            let late = now.0.saturating_sub(header.timestamp.get());
+            state.metrics.block_delays = state.metrics.block_delays.saturating_add(1);
+            state.metrics.block_delay_secs = state.metrics.block_delay_secs.saturating_add(late);
             sync::ask_block(
                 &state.network,
                 &mut state.pending,
