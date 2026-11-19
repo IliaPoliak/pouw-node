@@ -558,6 +558,20 @@ pub fn find_branch(reader: &Reader<'_>, id: &BlockId) -> Result<Branch, StoreErr
     })
 }
 
+/// Whether every block of `blocks` has its body. During initial block download the headers
+/// are stored well ahead of the bodies, and a block announced meanwhile can sit on top of
+/// ancestors that have none yet: a switch to its branch cannot load them.
+fn bodies_stored(reader: &Reader<'_>, blocks: &[BlockId]) -> Result<bool, StoreError> {
+    for id in blocks {
+        let held = store::index(reader, id)?
+            .is_some_and(|entry| entry.status.contains(Status::BODY_STORED));
+        if !held {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Switches to the branch ending in the stored block `id` when it beats the tip. A
 /// branch through a failed block is never followed: the failed block's stored
 /// descendants on it, `id` included, are marked [`Status::FAILED`].
@@ -583,6 +597,10 @@ fn side_branch(
             store::mark_failed(store, id)?;
         }
         return Ok(BlockOutcome::ParentFailed(*id));
+    }
+    if !bodies_stored(&store::read(store)?, &branch.blocks)? {
+        debug!(%id, "a branch whose ancestors have no body yet waits for them");
+        return Ok(BlockOutcome::SideBranch(*id));
     }
     if !better(&tip, &branch.tip) {
         warn!(%id, "a side branch with no more work than the tip is stored");

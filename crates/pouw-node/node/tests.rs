@@ -2738,3 +2738,76 @@ fn the_delay_of_an_announced_block_is_its_age_when_the_announcement_arrives() {
         (1, 7)
     );
 }
+
+/// Like [`sync_with`], but the peer mines on while the node downloads: from round `start`
+/// on, after every round of answers it adds a block to `theirs` and `chain` and announces
+/// the header, `blocks` times. A fault of the node ends the test.
+fn sync_while_peer_mines(
+    h: &mut Harness,
+    theirs: &mut store::Store,
+    chain: &mut Vec<Block>,
+    start: usize,
+    blocks: usize,
+) -> Vec<(PeerIx, Misbehavior)> {
+    let mut reported = Vec::new();
+    let mut ticked = false;
+    let mut round = 0_usize;
+    let mut mined = 0_usize;
+    loop {
+        run(h);
+        let mut asked = Vec::new();
+        for command in drain(h) {
+            match command {
+                Command::Request { id, request, .. } => asked.push((id, request)),
+                Command::Report(peer, why) => reported.push((peer, why)),
+                _ => {}
+            }
+        }
+        let progress = !asked.is_empty();
+        for (id, request) in asked {
+            let result = Ok(fetched(theirs, &request));
+            to_node(h, Inbound::Response { id, result });
+        }
+        round = round.saturating_add(1);
+        if round > start && mined < blocks {
+            let tip = chain.last().unwrap().clone();
+            let next = child(&tip, 10);
+            let id = put(theirs, &next);
+            store::connect_block(theirs, &id, &[], &StateDiff::default()).unwrap();
+            announce(h, next.header);
+            chain.push(next);
+            mined = mined.saturating_add(1);
+            ticked = false;
+            continue;
+        }
+        if progress {
+            ticked = false;
+            continue;
+        }
+        if ticked {
+            return reported;
+        }
+        ticked = true;
+        node::on_tick(&mut h.state).unwrap();
+    }
+}
+
+#[test]
+fn a_node_downloading_the_chain_survives_the_blocks_its_peer_mines_meanwhile() {
+    for start in 0..12 {
+        let mut h = harness();
+        let genesis = with_genesis(&mut h);
+        let mut chain = vec![genesis.clone()];
+        chain.extend(extend(&genesis, 100, 10));
+        let mut theirs = their_store(&chain);
+        status_from_peer(&h, status_of_peer(&h, &theirs));
+        let reported = sync_while_peer_mines(&mut h, &mut theirs, &mut chain, start, 20);
+        assert_eq!(reported, Vec::new(), "start {start}");
+        let tip = chain.last().unwrap();
+        let ours = store::tip(&store::read(&h.state.store).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(ours.id, block_id(&tip.header), "start {start}");
+        same_blocks(&h, &theirs, &chain);
+    }
+}
