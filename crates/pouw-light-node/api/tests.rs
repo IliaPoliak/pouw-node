@@ -683,3 +683,55 @@ fn a_proof_job_is_not_included_when_the_answer_is_not_about_its_request_or_its_p
         ],
     ));
 }
+
+fn metrics_text(api: &LightApi) -> String {
+    let (status, body) = call(api, "/metrics", false);
+    assert_eq!(status, 200);
+    String::from_utf8(body).unwrap()
+}
+
+#[test]
+fn the_metrics_show_the_head_and_count_the_requests_by_class() {
+    let (api, _) = api_with("metrics", 5, 8);
+    assert_eq!(call(&api, "/v1/light/head", true).0, 200);
+    assert_eq!(call(&api, "/v1/nothing", false).0, 404);
+    let text = metrics_text(&api);
+    for line in [
+        "# TYPE pouw_light_head_height gauge\n",
+        "pouw_light_head_height 4\n",
+        "pouw_light_headers 5\n",
+        "# TYPE pouw_light_requests_total counter\n",
+        "pouw_light_requests_total{class=\"2xx\"} 1\n",
+        "pouw_light_requests_total{class=\"4xx\"} 1\n",
+        "pouw_light_requests_total{class=\"5xx\"} 0\n",
+        "pouw_light_upstream_errors_total 0\n",
+    ] {
+        assert!(text.contains(line), "missing {line:?} in {text}");
+    }
+    // the first read of /metrics is counted in the second
+    assert!(metrics_text(&api).contains("pouw_light_requests_total{class=\"2xx\"} 2\n"));
+}
+
+#[test]
+fn a_light_node_without_headers_reports_a_head_of_zero() {
+    let (api, _) = api_with("metrics-empty", 0, 8);
+    let text = metrics_text(&api);
+    assert!(text.contains("pouw_light_head_height 0\n"), "{text}");
+    assert!(text.contains("pouw_light_headers 0\n"), "{text}");
+}
+
+#[test]
+fn a_full_node_that_cannot_be_reached_is_counted() {
+    let (api, _) = api_asking("metrics-dead", 2, &dead_node());
+    let account = text(&Address([0x11; 32]));
+    assert_eq!(call(&api, &format!("/v1/accounts/{account}"), true).0, 502);
+    let text = metrics_text(&api);
+    assert!(
+        text.contains("pouw_light_requests_total{class=\"5xx\"} 1\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("pouw_light_upstream_errors_total 1\n"),
+        "{text}"
+    );
+}
