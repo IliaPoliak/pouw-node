@@ -111,3 +111,15 @@ fn the_header_cache_must_be_a_positive_number() {
         );
     }
 }
+
+#[test]
+fn the_chain_spec_is_the_devnet_spec_unless_a_file_is_named() {
+    let config = LightConfig::from_vars(vars(&[])).unwrap();
+    assert_eq!(config.chain_spec, None);
+    let config =
+        LightConfig::from_vars(vars(&[(var::CHAIN_SPEC, "/etc/pouw/chain.json")])).unwrap();
+    assert_eq!(
+        config.chain_spec,
+        Some(std::path::PathBuf::from("/etc/pouw/chain.json"))
+    );
+}
