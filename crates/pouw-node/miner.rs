@@ -61,17 +61,20 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeSet, BinaryHeap, VecDeque},
+    time::Instant,
 };
 
+use pouw_api::event::{EventKind, LotteryResult, ProofProduced, ProofRequestStarted};
 use pouw_consensus::{
     ConsensusParams, InvalidBlock, Scratch, StateError, StateView, pow::meets, transition::cost,
     verify_pow,
 };
-use pouw_crypto::{Address, FieldInput, Hash32};
+use pouw_crypto::{Address, FieldInput, Hash32, hash_to_field};
 use pouw_provers::{Prover, ProverError, Statement};
 use pouw_types::{
-    Amount, Block, BlockHeader, BlockId, FastMap, PowNonce, ProofTx, SignedTx, Timestamp, TxId,
-    TxKind, U64, UsageCounter, block_id, eta_chain, mask,
+    Amount, Block, BlockHeader, BlockId, CircuitId, FastMap, Height, PowNonce, ProofSystem,
+    ProofTx, SignedTx, Timestamp, TxId, TxKind, U64, UsageCounter, block_id, eta_chain, mask,
+    proof_tx_hash,
     protocol::{
         BLOCK_VERSION, MAX_BLOCK_BYTES, MAX_PROOF_BYTES, MAX_PROOFS_PER_BLOCK, MAX_TXS_PER_BLOCK,
     },
@@ -82,6 +85,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     chain::{self, BlockOutcome, ChildRules},
+    events,
     mempool::{self, FeeRate, Mempool, Pending},
     node::{ComponentFault, NodeFault, NodeState},
     p2p::{Command, Gossip, PeerIx, limits::MAX_BLOCKS_PER_REQUEST, send as send_command},
@@ -184,6 +188,15 @@ pub enum InFlight {
     Verify { id: BlockId, peer: PeerIx },
 }
 
+/// What a proof was made for, as the events about it name it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attempt {
+    pub circuit: CircuitId,
+    pub system: ProofSystem,
+    pub eta: Hash32,
+    pub mask: Hash32,
+}
+
 /// What a proof is made for: the block it can join.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
@@ -193,6 +206,9 @@ pub struct Plan {
     /// The coin transactions the proof binds through eta.
     pub coin_txs: Vec<SignedTx>,
     pub counter: UsageCounter,
+    pub attempt: Attempt,
+    /// When the job was handed to the worker, for `prove_ms` of the event.
+    pub started: Instant,
 }
 
 /// A made proof waiting for the next template.
@@ -201,7 +217,29 @@ pub struct Held {
     pub parent: BlockId,
     pub coin_txs: Vec<SignedTx>,
     pub proof_tx: ProofTx,
+    pub attempt: Attempt,
 }
+
+/// A block this node mined with a proof in it, kept to report the proof lost when a
+/// reorganization drops the block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mined {
+    pub id: BlockId,
+    pub height: u64,
+    pub proof_tx: ProofTx,
+    pub attempt: Attempt,
+}
+
+/// How many mined blocks with a proof are watched for a reorganization.
+const MINED_KEPT: usize = 64;
+
+/// A mined block this far below the tip is final enough to stop watching.
+const MINED_DEPTH: u64 = 100;
+
+/// Why a proof lost the lottery, the `reason` of [`LotteryResult`].
+const LOST_SUPERSEDED: &str = "superseded";
+const LOST_REQUEST_GONE: &str = "request_gone";
+const LOST_ORPHANED: &str = "orphaned";
 
 /// The block being mined.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +276,8 @@ pub struct Work {
     pub tip: Option<BlockId>,
     /// The key of the next template.
     pub next_key: u64,
+    /// Blocks mined with a proof, newest last.
+    pub mined: VecDeque<Mined>,
 }
 
 pub fn new_work(jobs: mpsc::Sender<WorkJob>) -> Work {
@@ -250,6 +290,7 @@ pub fn new_work(jobs: mpsc::Sender<WorkJob>) -> Work {
         template: None,
         tip: None,
         next_key: 0,
+        mined: VecDeque::new(),
     }
 }
 
@@ -653,16 +694,25 @@ pub fn dispatch(state: &mut NodeState) -> Result<(), NodeFault> {
     let Some(tip) = read_tip(state)? else {
         return Ok(());
     };
-    follow_tip(state, &tip);
+    follow_tip(state, &tip)?;
     if state.work.held.is_none()
         && has_untried_request(state)
         && let Some((plan, job)) = plan_proof(state, &tip, &miner)?
     {
-        return send(
+        let started = ProofRequestStarted {
+            txid: job.request,
+            circuit: plan.attempt.circuit,
+            system: plan.attempt.system,
+        };
+        send(
             &mut state.work,
             WorkJob::Prove(Box::new(job)),
             InFlight::Prove(Box::new(plan)),
-        );
+        )?;
+        if state.work.in_flight.is_some() {
+            events::emit(&mut state.events, EventKind::ProofRequestStarted(started))?;
+        }
+        return Ok(());
     }
     search(state, &tip, &miner)
 }
@@ -675,16 +725,31 @@ fn has_untried_request(state: &NodeState) -> bool {
 }
 
 /// Drops what a new tip made stale: the skipped requests and a held proof of another
-/// parent, and a held proof whose request left the mempool.
-fn follow_tip(state: &mut NodeState, tip: &Tip) {
+/// parent, and a held proof whose request left the mempool. A dropped proof is a lost
+/// lottery (`lottery_result`), and a new tip settles the blocks mined earlier: one that a
+/// reorganization dropped is a lost lottery too.
+fn follow_tip(state: &mut NodeState, tip: &Tip) -> Result<(), NodeFault> {
     if state.work.tip != Some(tip.id) {
         state.work.tip = Some(tip.id);
         state.work.skipped.clear();
+        settle_mined(state, tip)?;
     }
-    let pool = &state.mempool;
-    state.work.held.take_if(|held| {
-        held.parent != tip.id || mempool::get(pool, &txid(&held.proof_tx.request)).is_none()
+    let reason = state.work.held.as_ref().and_then(|held| {
+        if held.parent != tip.id {
+            Some(LOST_SUPERSEDED)
+        } else if mempool::get(&state.mempool, &txid(&held.proof_tx.request)).is_none() {
+            Some(LOST_REQUEST_GONE)
+        } else {
+            None
+        }
     });
+    if let Some(reason) = reason
+        && let Some(held) = state.work.held.take()
+    {
+        let lost = lottery_result(&held.proof_tx, &held.attempt, Some(reason));
+        events::emit(&mut state.events, lost)?;
+    }
+    Ok(())
 }
 
 /// Picks the request to prove and the block it joins. A request of an unknown circuit
@@ -746,11 +811,12 @@ fn pick_proof(state: &NodeState, tip: &Tip, miner: &Address) -> Result<Pick, Sto
         proof: Box::from([]),
     };
     let eta = first_eta(&tip.id, &tip.rules.parent, &coin_txs, &proof_tx);
+    let proof_mask = mask(miner, circuit, counter);
     let job = ProofJob {
         request: *id,
         circuit: entry.circuit.clone(),
         eta,
-        mask: mask(miner, circuit, counter),
+        mask: proof_mask,
         client_inputs: public_inputs.clone(),
         witness: witness.clone(),
     };
@@ -759,6 +825,13 @@ fn pick_proof(state: &NodeState, tip: &Tip, miner: &Address) -> Result<Pick, Sto
         parent: tip.id,
         coin_txs,
         counter,
+        attempt: Attempt {
+            circuit: *circuit,
+            system: entry.system,
+            eta,
+            mask: proof_mask,
+        },
+        started: Instant::now(),
     };
     Ok(Pick::Job(Box::new((plan, job))))
 }
@@ -941,6 +1014,7 @@ fn seal(state: &mut NodeState, nonce: PowNonce) -> Result<(), NodeFault> {
         return Ok(());
     };
     info!(height = tip.height.0, id = %tip.id, "mined a block");
+    settle_win(state, &block, tip.id, tip.height.0)?;
     let announce = CheckedAnnounce {
         header: block.header,
         id: tip.id,
@@ -965,15 +1039,27 @@ pub fn on_proof(state: &mut NodeState, done: ProofDone) -> Result<(), NodeFault>
                 parent,
                 coin_txs,
                 counter,
+                attempt,
+                started,
             } = *plan;
+            let proof_tx = ProofTx {
+                request,
+                usage_counter: counter,
+                proof,
+            };
+            let produced = ProofProduced {
+                txid: done.request,
+                circuit: attempt.circuit,
+                system: attempt.system,
+                prove_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                proof_hash: proof_tx_hash(&proof_tx),
+            };
+            events::emit(&mut state.events, EventKind::ProofProduced(produced))?;
             state.work.held = Some(Held {
                 parent,
                 coin_txs,
-                proof_tx: ProofTx {
-                    request,
-                    usage_counter: counter,
-                    proof,
-                },
+                proof_tx,
+                attempt,
             });
         }
         Err(error) => {
@@ -982,6 +1068,78 @@ pub fn on_proof(state: &mut NodeState, done: ProofDone) -> Result<(), NodeFault>
         }
     }
     dispatch(state)
+}
+
+/// The `lottery_result` of a proof: a win when `lost` is `None`, else lost for that reason.
+fn lottery_result(proof_tx: &ProofTx, attempt: &Attempt, lost: Option<&str>) -> EventKind {
+    EventKind::LotteryResult(LotteryResult {
+        txid: txid(&proof_tx.request),
+        proof_hash: proof_tx_hash(proof_tx),
+        circuit: attempt.circuit,
+        won: lost.is_none(),
+        reason: lost.map(str::to_owned),
+        eta: hash_to_field(&attempt.eta),
+        mask: hash_to_field(&attempt.mask),
+        usage_counter: proof_tx.usage_counter.0,
+    })
+}
+
+/// The block this node mined carries the held proof: the lottery is won. The block is
+/// remembered to report the proof lost if a reorganization drops it.
+fn settle_win(
+    state: &mut NodeState,
+    block: &Block,
+    id: BlockId,
+    height: u64,
+) -> Result<(), NodeFault> {
+    let Some(proof_tx) = block.proof_txs.first() else {
+        return Ok(());
+    };
+    let Some(held) = state
+        .work
+        .held
+        .take_if(|held| held.proof_tx.request == proof_tx.request)
+    else {
+        return Ok(());
+    };
+    events::emit(
+        &mut state.events,
+        lottery_result(&held.proof_tx, &held.attempt, None),
+    )?;
+    state.work.mined.push_back(Mined {
+        id,
+        height,
+        proof_tx: held.proof_tx,
+        attempt: held.attempt,
+    });
+    while state.work.mined.len() > MINED_KEPT {
+        state.work.mined.pop_front();
+    }
+    Ok(())
+}
+
+/// Looks at the blocks this node mined with a proof when the tip changed: one that is no
+/// longer on the chain was dropped by a reorganization and its proof lost, one far below
+/// the tip is not watched any more.
+fn settle_mined(state: &mut NodeState, tip: &Tip) -> Result<(), NodeFault> {
+    let reader = store::read(&state.store)?;
+    let mut kept = VecDeque::new();
+    let mut orphaned = Vec::new();
+    for mined in std::mem::take(&mut state.work.mined) {
+        if store::canonical_id(&reader, Height(mined.height))? == Some(mined.id) {
+            if tip.height < mined.height.saturating_add(MINED_DEPTH) {
+                kept.push_back(mined);
+            }
+        } else {
+            orphaned.push(mined);
+        }
+    }
+    state.work.mined = kept;
+    for mined in orphaned {
+        let lost = lottery_result(&mined.proof_tx, &mined.attempt, Some(LOST_ORPHANED));
+        events::emit(&mut state.events, lost)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

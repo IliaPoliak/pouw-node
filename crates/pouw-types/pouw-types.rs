@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+mod bucket;
 mod chainspec;
 mod check;
 mod hash;
@@ -16,6 +17,7 @@ pub mod protocol;
 mod types;
 pub mod work;
 
+pub use bucket::{TEMPORARY_BUCKET_COUNT, bucket};
 pub use chainspec::{
     Allocation, ChainSpec, ConsensusParams, GenesisHeader, NetworkName, SpecError, check_genesis,
     genesis_block, genesis_id, parse_chain_spec,

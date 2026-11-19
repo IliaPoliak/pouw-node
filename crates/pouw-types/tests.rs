@@ -901,3 +901,57 @@ fn borsh_reads_exactly_the_header_size() {
     long.push(0);
     assert!(borsh::from_slice::<BlockHeader>(&long).is_err());
 }
+
+fn id_with_prefix(prefix: [u8; 4]) -> TxId {
+    let mut bytes = [0xAB_u8; 32];
+    for (byte, value) in bytes.iter_mut().zip(prefix) {
+        *byte = value;
+    }
+    TxId(Hash32(bytes))
+}
+
+#[test]
+fn a_request_falls_into_the_bucket_of_its_hash_prefix() {
+    // The prefix 01 02 03 04 read little-endian is 0x0403_0201 = 67_305_985.
+    let id = id_with_prefix([1, 2, 3, 4]);
+    assert_eq!(bucket(&id, 10), Some(5));
+    assert_eq!(bucket(&id, 4), Some(1));
+    assert_eq!(bucket(&id, 1), Some(0));
+    // Only the first 4 bytes count.
+    let mut other = id.hash().0;
+    if let Some(byte) = other.get_mut(4) {
+        *byte ^= 0xFF;
+    }
+    assert_eq!(bucket(&TxId(Hash32(other)), 10), Some(5));
+}
+
+#[test]
+fn the_bucket_is_right_at_the_edges_of_the_prefix() {
+    // The largest prefix is u32::MAX = 4_294_967_295.
+    let top = id_with_prefix([0xFF; 4]);
+    assert_eq!(bucket(&top, 7), Some(3));
+    assert_eq!(bucket(&top, u32::MAX), Some(0));
+    assert_eq!(bucket(&top, u32::MAX - 1), Some(1));
+    // The smallest prefix is in bucket 0 whatever the count.
+    let zero = id_with_prefix([0; 4]);
+    assert_eq!(bucket(&zero, 1000), Some(0));
+    // A prefix equal to the count wraps to bucket 0, one more is bucket 1.
+    assert_eq!(bucket(&id_with_prefix([10, 0, 0, 0]), 10), Some(0));
+    assert_eq!(bucket(&id_with_prefix([11, 0, 0, 0]), 10), Some(1));
+}
+
+#[test]
+fn no_request_has_a_bucket_among_zero_buckets() {
+    assert_eq!(bucket(&id_with_prefix([1, 2, 3, 4]), 0), None);
+}
+
+#[test]
+fn one_bucket_holds_every_request() {
+    assert_eq!(TEMPORARY_BUCKET_COUNT, 1);
+    for prefix in [[0; 4], [1, 2, 3, 4], [0xFF; 4]] {
+        assert_eq!(
+            bucket(&id_with_prefix(prefix), TEMPORARY_BUCKET_COUNT),
+            Some(0)
+        );
+    }
+}

@@ -121,3 +121,20 @@ fn only_http_nodes_are_used_and_the_port_defaults_to_80() {
     ]);
     assert_eq!(upstream.len(), 2);
 }
+
+#[test]
+fn get_from_asks_the_one_node_it_is_given() {
+    let (url, node) = fake_node(vec![http("404 Not Found", "application/json", b"{}")]);
+    let upstream = Upstream::new(&[dead_node(), url]);
+    let answer = upstream.get_from(1, "/v1/x", true).unwrap();
+    assert_eq!(answer.status, 404);
+    assert!(matches!(
+        upstream.get_from(0, "/v1/x", true),
+        Err(UpstreamError::Unreachable(_))
+    ));
+    assert!(matches!(
+        upstream.get_from(2, "/v1/x", true),
+        Err(UpstreamError::NoNodes)
+    ));
+    assert_eq!(node.join().unwrap().len(), 1);
+}
