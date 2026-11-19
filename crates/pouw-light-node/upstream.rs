@@ -82,6 +82,19 @@ impl Upstream {
         }
         Err(UpstreamError::Unreachable(last))
     }
+
+    /// `GET path` on the full node number `node` of the configuration only, whatever it
+    /// answers. The header sync uses it to judge each node by itself.
+    ///
+    /// # Errors
+    ///
+    /// [`UpstreamError::NoNodes`] when there is no such node,
+    /// [`UpstreamError::Unreachable`] when it cannot be reached.
+    pub fn get_from(&self, node: usize, path: &str, json: bool) -> Result<Answer, UpstreamError> {
+        let address = self.nodes.get(node).ok_or(UpstreamError::NoNodes)?;
+        fetch(address, path, json)
+            .map_err(|error| UpstreamError::Unreachable(format!("{address}: {error}")))
+    }
 }
 
 fn fetch(node: &str, path: &str, json: bool) -> io::Result<Answer> {
