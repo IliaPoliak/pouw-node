@@ -2738,3 +2738,102 @@ fn the_delay_of_an_announced_block_is_its_age_when_the_announcement_arrives() {
         (1, 7)
     );
 }
+
+fn lottery_results(h: &Harness) -> Vec<pouw_api::event::LotteryResult> {
+    h.state
+        .events
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::LotteryResult(result) => Some(result.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_miner_reports_the_proof_it_makes_and_the_lottery_it_wins() {
+    let mut h = harness();
+    with_circuit(&mut h);
+    h.state.miner = Some(MINER);
+    let request = proof_request(1, 0);
+    pool(&mut h, request.clone());
+    mine_to(&mut h, 1);
+    let names: Vec<&str> = kinds(&h.state.events)
+        .into_iter()
+        .filter(|name| name.starts_with("proof_") || *name == "lottery_result")
+        .collect();
+    assert_eq!(
+        names,
+        ["proof_request_started", "proof_produced", "lottery_result"]
+    );
+    let produced = h
+        .state
+        .events
+        .events
+        .iter()
+        .find_map(|event| match &event.kind {
+            EventKind::ProofProduced(produced) => Some(produced.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let [result] = lottery_results(&h).try_into().unwrap();
+    assert!(result.won);
+    assert_eq!(result.reason, None);
+    assert_eq!(result.txid, txid(&request));
+    assert_eq!(result.circuit, circuit_id());
+    assert_eq!(result.usage_counter, 0);
+    assert_eq!(produced.txid, result.txid);
+    assert_eq!(produced.proof_hash, result.proof_hash);
+    let mined = canonical_blocks(&h, 1..=1).remove(0);
+    assert_eq!(result.proof_hash, proof_tx_hash(&mined.proof_txs[0]));
+}
+
+#[test]
+fn a_proof_made_for_a_tip_that_a_peer_block_replaces_is_a_lost_lottery() {
+    let mut h = harness();
+    let genesis = with_circuit(&mut h);
+    h.state.miner = Some(MINER);
+    pool(&mut h, proof_request(1, 0));
+    // the worker makes the proof and the miner holds it
+    miner::dispatch(&mut h.state).unwrap();
+    let job = h.jobs.try_recv().unwrap();
+    let done = miner::run_job(&h.prover, &h.state.params, job);
+    node::handle(&mut h.state, Event::Work(done)).unwrap();
+    assert!(h.state.work.held.is_some());
+    // the search that follows is dropped, so the block of a peer comes first
+    while h.jobs.try_recv().is_ok() {}
+    h.state.work.in_flight = None;
+    deliver(&mut h, &block(&genesis, vec![]));
+    pump_until(&mut h, |h| !lottery_results(h).is_empty()).unwrap();
+    let results = lottery_results(&h);
+    assert!(!results[0].won);
+    assert_eq!(results[0].reason.as_deref(), Some("superseded"));
+}
+
+#[test]
+fn a_won_lottery_is_reported_lost_when_a_reorg_drops_the_block() {
+    let mut h = harness();
+    let genesis = with_circuit(&mut h);
+    h.state.miner = Some(MINER);
+    pool(&mut h, proof_request(1, 0));
+    mine_to(&mut h, 1);
+    assert_eq!(lottery_results(&h).len(), 1);
+    // the node stops mining and a peer's branch of two blocks beats our one
+    stop_mining(&mut h);
+    let first = block(&genesis, vec![]);
+    let second = block(&first, vec![]);
+    deliver(&mut h, &first);
+    deliver(&mut h, &second);
+    run(&mut h);
+    assert_eq!(height_of(&h), 2);
+    // the miner comes back and sees the new tip
+    h.state.miner = Some(MINER);
+    miner::dispatch(&mut h.state).unwrap();
+    let results = lottery_results(&h);
+    assert_eq!(results.len(), 2);
+    assert!(results[0].won);
+    assert!(!results[1].won);
+    assert_eq!(results[1].reason.as_deref(), Some("orphaned"));
+    assert_eq!(results[1].proof_hash, results[0].proof_hash);
+}

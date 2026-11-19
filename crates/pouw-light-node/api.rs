@@ -3,7 +3,9 @@
 //!
 //! Answered from the header store: `GET /v1/light/head`,
 //! `GET /v1/blocks/{height_or_hash}/header` and `GET /v1/headers?from=&to=`, and
-//! `GET /health`. Asked of a full node (`POUW_FULL_NODES`) and passed on: the block,
+//! `GET /health`. `GET /metrics` is the Prometheus text of the light node: the height of
+//! the head and the number of headers, the requests answered by class of status, and the
+//! requests a full node could not answer. Asked of a full node (`POUW_FULL_NODES`) and passed on: the block,
 //! `GET /v1/accounts/{addr}`, `GET /v1/txs/{txid}` and its `/inclusion-proof`.
 //! `GET /v1/light/proof-jobs/{txid}` is built from the tx of a full node and the
 //! headers of the store, and an included job is reported only when the inclusion proof
@@ -25,14 +27,17 @@
 use std::{
     io::{self, BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
-    sync::{Arc, PoisonError, RwLock},
+    sync::{
+        Arc, PoisonError, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::Duration,
 };
 
 use pouw_api::{
     error::{ErrorBody, code},
-    path::{HEADERS, HEALTH},
+    path::{HEADERS, HEALTH, METRICS},
     view::{HeaderView, HeadersPage, InclusionProof, MAX_HEADERS_PER_CALL, TxStatus, TxView},
 };
 use pouw_crypto::Address;
@@ -57,6 +62,7 @@ const UNKNOWN_TX: &str = "unknown_tx";
 const UNKNOWN_PROOF_JOB: &str = "unknown_proof_job";
 
 const JSON: &str = "application/json";
+const TEXT: &str = "text/plain; version=0.0.4; charset=utf-8";
 const OCTETS: &str = "application/octet-stream";
 
 /// Most bytes of a request head the server reads.
@@ -69,6 +75,16 @@ const IO_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct LightApi {
     store: RwLock<HeaderStore>,
     upstream: Upstream,
+    counts: Counts,
+}
+
+/// The counters behind `/metrics`.
+#[derive(Debug, Default)]
+struct Counts {
+    ok: AtomicU64,
+    client_errors: AtomicU64,
+    server_errors: AtomicU64,
+    upstream_errors: AtomicU64,
 }
 
 impl LightApi {
@@ -76,6 +92,21 @@ impl LightApi {
         Self {
             store: RwLock::new(store),
             upstream,
+            counts: Counts::default(),
+        }
+    }
+
+    /// Counts the answer `reply` by the class of its status. A 502 is also a request that
+    /// a full node could not answer.
+    fn count(&self, reply: &Reply) {
+        let counter = match reply.status.as_bytes().first() {
+            Some(b'2') => &self.counts.ok,
+            Some(b'4') => &self.counts.client_errors,
+            _ => &self.counts.server_errors,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        if reply.status.starts_with("502") {
+            self.counts.upstream_errors.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -437,6 +468,41 @@ fn head(api: &LightApi) -> Reply {
     }
 }
 
+/// `GET /metrics`: the Prometheus text exposition.
+fn metrics(api: &LightApi) -> Reply {
+    let held = api.read(|store| Ok((store.tip().map_or(0, |(height, _)| height.0), store.len())));
+    let (height, headers) = match held {
+        Ok(held) => held,
+        Err(reply) => return reply,
+    };
+    let counts = &api.counts;
+    let body = format!(
+        "# HELP pouw_light_head_height Height of the head of the header store, 0 while it is empty.\n\
+         # TYPE pouw_light_head_height gauge\n\
+         pouw_light_head_height {height}\n\
+         # HELP pouw_light_headers Headers in the header store.\n\
+         # TYPE pouw_light_headers gauge\n\
+         pouw_light_headers {headers}\n\
+         # HELP pouw_light_requests_total Requests answered, by class of the status.\n\
+         # TYPE pouw_light_requests_total counter\n\
+         pouw_light_requests_total{{class=\"2xx\"}} {ok}\n\
+         pouw_light_requests_total{{class=\"4xx\"}} {client}\n\
+         pouw_light_requests_total{{class=\"5xx\"}} {server}\n\
+         # HELP pouw_light_upstream_errors_total Requests that no full node could answer (502).\n\
+         # TYPE pouw_light_upstream_errors_total counter\n\
+         pouw_light_upstream_errors_total {upstream}\n",
+        ok = counts.ok.load(Ordering::Relaxed),
+        client = counts.client_errors.load(Ordering::Relaxed),
+        server = counts.server_errors.load(Ordering::Relaxed),
+        upstream = counts.upstream_errors.load(Ordering::Relaxed),
+    );
+    Reply {
+        status: "200 OK",
+        content_type: TEXT,
+        body: body.into_bytes(),
+    }
+}
+
 fn header(api: &LightApi, key: &str, json: bool) -> Reply {
     let found = match block_key(key) {
         None => return Reply::bad_request("not a height or a blk: id"),
@@ -533,6 +599,7 @@ fn route(api: &LightApi, request_line: &str, json: bool) -> Reply {
             content_type: JSON,
             body: br#"{"status":"ok"}"#.to_vec(),
         },
+        METRICS => metrics(api),
         LIGHT_HEAD => head(api),
         HEADERS => headers(api, query),
         other => with_id(api, other, json),
@@ -542,7 +609,9 @@ fn route(api: &LightApi, request_line: &str, json: bool) -> Reply {
 /// The full HTTP response for a request line such as `GET /health HTTP/1.1`. `json` is
 /// whether the request names `application/json` in its `Accept` header.
 pub fn respond(api: &LightApi, request_line: &str, json: bool) -> Vec<u8> {
-    route(api, request_line, json).to_bytes()
+    let reply = route(api, request_line, json);
+    api.count(&reply);
+    reply.to_bytes()
 }
 
 /// Accepts connections until the process ends, one thread per connection.

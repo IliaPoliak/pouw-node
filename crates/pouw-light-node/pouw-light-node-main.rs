@@ -5,12 +5,22 @@
 //! Exit codes: 0 after a shutdown signal, 1 when the light node cannot start, 2 for an
 //! invalid configuration.
 
-use std::{env, fs, net::TcpListener, process::ExitCode, sync::Arc, thread};
+use std::{
+    env, fs,
+    net::TcpListener,
+    process::ExitCode,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+};
 
 use pouw_light_node::{
     api::{self, LightApi},
     config::LightConfig,
     headers::HeaderStore,
+    sync::{HeaderSync, load_chain},
     upstream::Upstream,
 };
 use signal_hook::{
@@ -55,14 +65,14 @@ fn main() -> ExitCode {
         error!(%error, dir = %config.data_dir.display(), "cannot create the data directory");
         return ExitCode::FAILURE;
     }
-    let headers = match HeaderStore::open(&config.data_dir.join("headers.bin"), config.header_cache)
-    {
-        Ok(headers) => headers,
-        Err(error) => {
-            error!(%error, "cannot open the header store");
-            return ExitCode::FAILURE;
-        }
-    };
+    let mut headers =
+        match HeaderStore::open(&config.data_dir.join("headers.bin"), config.header_cache) {
+            Ok(headers) => headers,
+            Err(error) => {
+                error!(%error, "cannot open the header store");
+                return ExitCode::FAILURE;
+            }
+        };
     if let Some((height, id)) = headers.tip() {
         info!(
             height = height.0,
@@ -85,7 +95,21 @@ fn main() -> ExitCode {
     if upstream.len() < config.full_nodes.len() {
         warn!("only http:// full nodes are used, the others are left out");
     }
+    let syncer = match start_sync(&config, &upstream, &mut headers) {
+        Ok(syncer) => syncer,
+        Err(code) => return code,
+    };
     let api = Arc::new(LightApi::new(headers, upstream));
+    let stop = Arc::new(AtomicBool::new(false));
+    let followed = Arc::clone(&api);
+    let halt = Arc::clone(&stop);
+    let follower = thread::Builder::new()
+        .name("sync".to_owned())
+        .spawn(move || syncer.run(followed.store(), &halt));
+    if let Err(error) = follower {
+        error!(%error, "cannot start the sync thread");
+        return ExitCode::FAILURE;
+    }
     let server = thread::Builder::new()
         .name("api".to_owned())
         .spawn(move || api::serve(&listener, &api));
@@ -96,5 +120,33 @@ fn main() -> ExitCode {
     if let Some(signal) = signals.forever().next() {
         info!(signal, "shutdown requested");
     }
+    stop.store(true, Ordering::Relaxed);
     ExitCode::SUCCESS
+}
+
+/// The sync of the chain of the chain spec, started on the header store. The error is
+/// the exit code of the process.
+fn start_sync(
+    config: &LightConfig,
+    upstream: &Upstream,
+    headers: &mut HeaderStore,
+) -> Result<HeaderSync, ExitCode> {
+    let (spec, genesis) = match load_chain(config.chain_spec.as_deref()) {
+        Ok(chain) => chain,
+        Err(error) => {
+            error!(%error, "invalid chain spec");
+            return Err(ExitCode::from(2));
+        }
+    };
+    info!(
+        network = %spec.network,
+        genesis = %spec.expected_genesis_id,
+        "following the chain of the chain spec"
+    );
+    let syncer = HeaderSync::new(spec.params, genesis, upstream.clone());
+    if let Err(error) = syncer.start(headers) {
+        error!(%error, "the stored headers are not of the chain of the chain spec");
+        return Err(ExitCode::FAILURE);
+    }
+    Ok(syncer)
 }
