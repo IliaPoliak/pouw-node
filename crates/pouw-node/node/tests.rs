@@ -1,4 +1,8 @@
-use std::{cell::Cell, collections::VecDeque, time::Duration};
+use std::{
+    cell::Cell,
+    collections::{BTreeSet, VecDeque},
+    time::Duration,
+};
 
 use pouw_api::{
     event::EventKind,
@@ -10,7 +14,7 @@ use pouw_provers::{MockProver, Prover, Statement};
 use pouw_types::{
     Amount, Block, BlockHeader, BlockId, ChainId, CircuitEntry, CircuitId, ConsensusParams,
     ConstraintCount, CumWork, Height, Nonce, ProofSystem, SignedTx, SystemId, Target, Timestamp,
-    TxBody, TxId, TxKind, U32, U64, UsageCounter, block_id, block_work, eta_chain, mask,
+    TxBody, TxId, TxKind, U32, U64, U256, UsageCounter, block_id, block_work, eta_chain, mask,
     proof_tx_hash, sign_body, txid, verify_inclusion,
 };
 use tokio::{
@@ -22,6 +26,7 @@ use crate::{
     api::{self, ApiRequest, BlockKey, BlockQuery, BlockReply, Ranged, TxReply},
     chain::{self, TxOutcome},
     events::{self, EventLog},
+    ibd::Ibd,
     mempool::{self, MempoolLimits},
     metrics::Metrics,
     miner::{self, ProofDone, WorkDone, WorkJob},
@@ -36,7 +41,7 @@ use crate::{
     },
     precheck::{self, CheckedAnnounce, CheckedBlock, CheckedTx, Fetched},
     store,
-    sync::PendingRequest,
+    sync::{self, PendingRequest},
 };
 
 const CHAIN: ChainId = ChainId(1);
@@ -107,6 +112,7 @@ fn harness() -> Harness {
         network,
         pending: Vec::new(),
         next_request: RequestId(0),
+        ibd: Ibd::default(),
         work: miner::new_work(prover_jobs),
         clock: test_clock,
         ticks: 0,
@@ -2185,4 +2191,550 @@ fn the_circuits_of_a_rocksdb_store_are_listed_by_registration_and_survive_a_rest
     h.state.store = store::memory();
     let reopened = open();
     assert_eq!(listed(&reopened), expected);
+}
+
+// Initial block download (pouw-node#90). The peer is a store that holds a chain: it
+// answers the requests of the node with `sync::answer`, as a node does.
+
+/// The valid child of `parent`, `secs` after it, with the target of the rule.
+fn child(parent: &Block, secs: u64) -> Block {
+    let params = test_params();
+    let anchor = Anchor::first_block(&params, &genesis_block().header);
+    let target = next_target(&params, SystemId(0), &anchor, &parent.header).unwrap();
+    raw_block(
+        parent.header.height.get().saturating_add(1),
+        block_id(&parent.header),
+        parent.header.timestamp.get().saturating_add(secs),
+        target,
+        vec![],
+    )
+}
+
+/// `count` blocks after `parent`, each `secs` after the one before. A block every ten
+/// seconds is the pace of the rule, so the target stays where it is and mining stays cheap.
+fn extend(parent: &Block, count: u64, secs: u64) -> Vec<Block> {
+    let mut blocks = Vec::new();
+    let mut tip = parent.clone();
+    for _ in 0..count {
+        tip = child(&tip, secs);
+        blocks.push(tip.clone());
+    }
+    blocks
+}
+
+/// The store of a peer whose chain is `chain`, the genesis first.
+fn their_store(chain: &[Block]) -> store::Store {
+    let mut theirs = store::memory();
+    for block in chain {
+        let id = put(&mut theirs, block);
+        store::connect_block(&mut theirs, &id, &[], &StateDiff::default()).unwrap();
+    }
+    theirs
+}
+
+/// The `Status` of the peer with the chain of `theirs`, on our chain id and genesis.
+fn status_of_peer(h: &Harness, theirs: &store::Store) -> Status {
+    let tip = store::tip(&store::read(theirs).unwrap()).unwrap().unwrap();
+    Status {
+        tip: tip.id,
+        height: tip.height,
+        cumulative_work: tip.cumulative_work,
+        ..status_of(h)
+    }
+}
+
+fn fetched(theirs: &store::Store, request: &SyncRequest) -> Fetched {
+    match sync::answer(theirs, request).unwrap() {
+        SyncResponse::Headers(headers) => Fetched::Headers(headers),
+        SyncResponse::Blocks(blocks) => Fetched::Blocks(
+            blocks
+                .iter()
+                .map(|bytes| checked(borsh::from_slice(bytes).unwrap()))
+                .collect(),
+        ),
+    }
+}
+
+/// Runs the node and answers every request it sends to the peer from `theirs`, until it
+/// asks nothing more, also after one tick. Returns the requests in the order they were
+/// sent and what the node reported. Never more than one `GetBlocks` is out at a time.
+fn sync_with(
+    h: &mut Harness,
+    theirs: &store::Store,
+) -> (Vec<SyncRequest>, Vec<(PeerIx, Misbehavior)>) {
+    let mut seen = Vec::new();
+    let mut reported = Vec::new();
+    let mut ticked = false;
+    loop {
+        run(h);
+        let mut asked = Vec::new();
+        for command in drain(h) {
+            match command {
+                Command::Request { id, request, .. } => asked.push((id, request)),
+                Command::Report(peer, why) => reported.push((peer, why)),
+                _ => {}
+            }
+        }
+        if asked.is_empty() {
+            if ticked {
+                return (seen, reported);
+            }
+            ticked = true;
+            node::on_tick(&mut h.state).unwrap();
+            continue;
+        }
+        ticked = false;
+        let windows = asked
+            .iter()
+            .filter(|(_, request)| matches!(request, SyncRequest::GetBlocks(_)))
+            .count();
+        assert!(windows <= 1, "{windows} windows in flight");
+        for (id, request) in asked {
+            let result = Ok(fetched(theirs, &request));
+            seen.push(request);
+            to_node(h, Inbound::Response { id, result });
+        }
+    }
+}
+
+fn same_blocks(h: &Harness, theirs: &store::Store, chain: &[Block]) {
+    let ours = store::read(&h.state.store).unwrap();
+    let theirs = store::read(theirs).unwrap();
+    for block in chain {
+        let id = block_id(&block.header);
+        assert_eq!(
+            store::header(&ours, &id).unwrap(),
+            store::header(&theirs, &id).unwrap()
+        );
+        assert_eq!(
+            store::block(&ours, &id).unwrap().map(|b| b.bytes.to_vec()),
+            store::block(&theirs, &id)
+                .unwrap()
+                .map(|b| b.bytes.to_vec()),
+        );
+    }
+}
+
+#[test]
+fn a_node_that_starts_empty_downloads_the_chain_of_its_peer() {
+    let mut h = harness();
+    let genesis = with_genesis(&mut h);
+    let mut chain = vec![genesis.clone()];
+    chain.extend(extend(&genesis, 5000, 10));
+    let theirs = their_store(&chain);
+    status_from_peer(&h, status_of_peer(&h, &theirs));
+    let (requests, reported) = sync_with(&mut h, &theirs);
+    assert_eq!(reported, Vec::new());
+    assert_eq!(tip_height(&h), Some(Height(5000)));
+    let tip = chain.last().unwrap();
+    let ours = store::tip(&store::read(&h.state.store).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(ours.id, block_id(&tip.header));
+    same_blocks(&h, &theirs, &chain);
+    assert_eq!(h.state.metrics.dropped_blocks, 0);
+
+    // three pages of headers (2000, 2000, 1000), the later ones from the last header
+    let header_asks: Vec<&GetHeaders> = requests
+        .iter()
+        .filter_map(|request| match request {
+            SyncRequest::GetHeaders(get) => Some(&**get),
+            SyncRequest::GetBlocks(_) => None,
+        })
+        .collect();
+    assert_eq!(header_asks.len(), 3);
+    let first_of_page = |page: usize| block_id(&chain[page * 2000].header);
+    assert_eq!(header_asks[1].locator[0], first_of_page(1));
+    assert_eq!(header_asks[2].locator[0], first_of_page(2));
+    assert!(header_asks.iter().all(|get| get.locator.len() <= 64));
+
+    // every body once, in windows of at most 16
+    let mut asked = Vec::new();
+    for request in &requests {
+        if let SyncRequest::GetBlocks(get) = request {
+            assert!(get.ids.len() <= 16);
+            asked.extend(get.ids.iter().copied());
+        }
+    }
+    assert_eq!(asked.len(), 5000);
+    assert_eq!(asked.iter().collect::<BTreeSet<_>>().len(), 5000);
+    let heights: Vec<BlockId> = chain.iter().skip(1).map(|b| block_id(&b.header)).collect();
+    assert_eq!(asked, heights);
+}
+
+#[test]
+fn a_peer_on_a_fork_with_more_work_switches_the_chain() {
+    let mut h = harness();
+    let genesis = with_genesis(&mut h);
+    let ours = extend(&genesis, 10, 10);
+    for block in &ours {
+        deliver(&mut h, block);
+    }
+    run(&mut h);
+    assert_eq!(tip_height(&h), Some(Height(10)));
+    assert_eq!(reports(&mut h), Vec::new());
+
+    // the peer shares the first five blocks and goes on to 15 on its own
+    let mut chain = vec![genesis.clone()];
+    chain.extend(ours.iter().take(5).cloned());
+    let fork_point = chain.last().unwrap().clone();
+    chain.extend(extend(&fork_point, 10, 11));
+    let theirs = their_store(&chain);
+    status_from_peer(&h, status_of_peer(&h, &theirs));
+    let (requests, reported) = sync_with(&mut h, &theirs);
+    assert_eq!(reported, Vec::new());
+    assert_eq!(tip_height(&h), Some(Height(15)));
+    let tip = chain.last().unwrap();
+    let now = store::tip(&store::read(&h.state.store).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(now.id, block_id(&tip.header));
+    same_blocks(&h, &theirs, &chain);
+
+    // only the ten blocks of the fork were fetched, not the five we had
+    let asked: usize = requests
+        .iter()
+        .map(|request| match request {
+            SyncRequest::GetBlocks(get) => get.ids.len(),
+            SyncRequest::GetHeaders(_) => 0,
+        })
+        .sum();
+    assert_eq!(asked, 10);
+}
+
+#[test]
+fn a_chain_below_min_chain_work_is_kept_as_headers_and_no_body_is_asked() {
+    let mut h = harness();
+    h.state.min_chain_work = CumWork(U256::MAX);
+    let genesis = with_genesis(&mut h);
+    let mut chain = vec![genesis.clone()];
+    chain.extend(extend(&genesis, 30, 10));
+    let theirs = their_store(&chain);
+    status_from_peer(&h, status_of_peer(&h, &theirs));
+    let (requests, reported) = sync_with(&mut h, &theirs);
+    assert_eq!(reported, Vec::new());
+    assert!(
+        requests
+            .iter()
+            .all(|request| matches!(request, SyncRequest::GetHeaders(_)))
+    );
+    assert_eq!(tip_height(&h), Some(Height(0)));
+    let reader = store::read(&h.state.store).unwrap();
+    let last = block_id(&chain.last().unwrap().header);
+    let entry = store::index(&reader, &last).unwrap().unwrap();
+    assert_eq!(entry.height(), Height(30));
+    assert!(store::block(&reader, &last).unwrap().is_none());
+}
+
+/// Blocks 1 and 2, a block 3 whose header does not meet its target, and nine more.
+fn chain_with_a_bad_work_claim(genesis: &Block) -> Vec<Block> {
+    let mut chain = vec![genesis.clone()];
+    chain.extend(extend(genesis, 2, 10));
+    let mut bad = child(chain.last().unwrap(), 10);
+    while block_id(&bad.header).0.0 <= bad.header.target.0 {
+        bad.header.nonce = U64::new(bad.header.nonce.get().wrapping_add(1));
+    }
+    chain.push(bad.clone());
+    chain.extend(extend(&bad, 9, 10));
+    chain
+}
+
+#[test]
+fn the_ancestors_of_assume_valid_skip_the_work_check_and_the_other_blocks_do_not() {
+    // with assume_valid at block 10 the bad claim of block 3 is not looked at
+    let mut h = harness();
+    let genesis = with_genesis(&mut h);
+    let chain = chain_with_a_bad_work_claim(&genesis);
+    let theirs = their_store(&chain);
+    h.state.assume_valid = chain.get(10).map(|block| block_id(&block.header));
+    status_from_peer(&h, status_of_peer(&h, &theirs));
+    let (_, reported) = sync_with(&mut h, &theirs);
+    assert_eq!(reported, Vec::new());
+    assert_eq!(tip_height(&h), Some(Height(12)));
+
+    // without it the claim is checked, the peer is reported, and the blocks it sent
+    // after the bad one are dropped, not stored
+    let mut h = harness();
+    let genesis = with_genesis(&mut h);
+    let chain = chain_with_a_bad_work_claim(&genesis);
+    let theirs = their_store(&chain);
+    status_from_peer(&h, status_of_peer(&h, &theirs));
+    let (_, reported) = sync_with(&mut h, &theirs);
+    assert_eq!(reported, [(peer(), Misbehavior::InvalidBlock)]);
+    assert_eq!(tip_height(&h), Some(Height(2)));
+    let reader = store::read(&h.state.store).unwrap();
+    let fourth = block_id(&chain[4].header);
+    assert!(store::block(&reader, &fourth).unwrap().is_none());
+}
+
+#[test]
+fn headers_that_do_not_link_are_reported_and_no_body_is_asked() {
+    let mut h = harness();
+    let genesis = with_genesis(&mut h);
+    let blocks = extend(&genesis, 3, 10);
+    let id = pend(
+        &mut h,
+        SyncRequest::GetHeaders(Box::new(GetHeaders {
+            locator: vec![block_id(&genesis.header)],
+            stop: None,
+        })),
+    );
+    // the second header does not have the first as its parent
+    let headers = vec![blocks[0].header, blocks[2].header];
+    let result = Ok(Fetched::Headers(headers));
+    to_node(&h, Inbound::Response { id, result });
+    run(&mut h);
+    let commands = drain(&mut h);
+    assert!(
+        matches!(
+            commands.as_slice(),
+            [Command::Report(who, Misbehavior::InvalidBlock)] if *who == peer()
+        ),
+        "{commands:?}"
+    );
+}
+
+#[test]
+fn headers_of_a_peer_that_ignored_our_locator_are_reported() {
+    let mut h = harness();
+    let genesis = with_genesis(&mut h);
+    let blocks = extend(&genesis, 3, 10);
+    let id = pend(
+        &mut h,
+        SyncRequest::GetHeaders(Box::new(GetHeaders {
+            locator: vec![block_id(&genesis.header)],
+            stop: None,
+        })),
+    );
+    // the answer starts above a block we do not have
+    let result = Ok(Fetched::Headers(vec![blocks[1].header]));
+    to_node(&h, Inbound::Response { id, result });
+    run(&mut h);
+    assert_eq!(reports(&mut h), [(peer(), Misbehavior::InvalidBlock)]);
+}
+
+// Two nodes, each with its own transport thread and libp2p swarm on 127.0.0.1
+// (pouw-node#86): what one node pools and broadcasts, the other pools.
+
+/// A port nothing listens on at the moment.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Starts the transport of `h` on its own thread, listening on `port` and dialing
+/// `bootnodes`, and returns the directory of its key. The transport takes the commands
+/// of the node from now on.
+fn start_transport(
+    h: &mut Harness,
+    name: &str,
+    port: u16,
+    bootnodes: Vec<String>,
+) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("pouw-two-nodes-{}-{name}", std::process::id()));
+    drop(std::fs::remove_dir_all(&dir));
+    let config = crate::p2p::TransportConfig {
+        network: pouw_types::NetworkName::try_from("devnet".to_owned()).unwrap(),
+        listen: vec![format!("/ip4/127.0.0.1/tcp/{port}")],
+        bootnodes,
+        limits: crate::p2p::PeerLimits::default(),
+        data_dir: dir.clone(),
+    };
+    let (_, unused) = mpsc::channel(1);
+    let outbound = std::mem::replace(&mut h.outbound, unused);
+    let inbound = h.feeds.p2p.clone();
+    std::thread::spawn(move || {
+        drop(crate::p2p::run_transport(
+            &config,
+            &test_params(),
+            outbound,
+            &inbound,
+        ));
+    });
+    dir
+}
+
+#[test]
+fn a_transaction_submitted_to_one_node_reaches_the_mempool_of_another() {
+    let mut a = harness();
+    let mut b = harness();
+    with_genesis(&mut a);
+    with_genesis(&mut b);
+    let port = free_port();
+    let dir_a = start_transport(&mut a, "a", port, vec![]);
+    let dir_b = start_transport(
+        &mut b,
+        "b",
+        free_port(),
+        vec![format!("/ip4/127.0.0.1/tcp/{port}")],
+    );
+
+    // The peers learn each other's topics a moment after they connect, and a message
+    // published before that reaches nobody. So a new transaction goes to the first node
+    // every half second (each from a sender of its own, so none is refused as a
+    // duplicate or for lack of slots) until the second node has one.
+    let start = std::time::Instant::now();
+    let mut sent = Vec::new();
+    let mut replies = Vec::new();
+    let mut seed = 0u8;
+    let mut last = None::<std::time::Instant>;
+    while b.state.mempool.txs.is_empty() {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "no transaction reached the second node, {} were sent",
+            sent.len()
+        );
+        if last.is_none_or(|at| at.elapsed() >= Duration::from_millis(500)) {
+            let tx = transfer_from(seed, CHAIN, 0);
+            seed = seed.wrapping_add(1);
+            let (reply, answer) = oneshot::channel();
+            let checked = submitted(tx.clone());
+            to_api(&a, ApiRequest::SubmitTx { checked, reply });
+            sent.push(tx);
+            replies.push(answer);
+            last = Some(std::time::Instant::now());
+        }
+        run(&mut a);
+        run(&mut b);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let arrived = sent
+        .iter()
+        .filter(|tx| mempool::get(&b.state.mempool, &txid(tx)).is_some())
+        .count();
+    assert!(
+        arrived >= 1,
+        "the pool of the second node holds no sent transaction"
+    );
+    // the first node keeps what it was sent
+    assert!(a.state.mempool.txs.len() >= arrived);
+    assert_eq!(a.state.metrics.dropped_commands, 0);
+    assert_eq!(b.state.metrics.dropped_commands, 0);
+    drop(std::fs::remove_dir_all(dir_a));
+    drop(std::fs::remove_dir_all(dir_b));
+}
+
+// Network metrics (pouw-node#87).
+
+use crate::metrics::MessageKind;
+
+#[test]
+fn messages_are_counted_by_kind_when_they_come_and_when_they_go() {
+    let mut h = harness();
+    let genesis = with_genesis(&mut h);
+    let child = block(&genesis, vec![]);
+    gossip(&mut h, Gossip::Tx(Box::new(checked_tx(transfer(CHAIN, 0)))));
+    announce(&mut h, child.header);
+    status_from_peer(&h, status_of(&h));
+    to_node(
+        &h,
+        Inbound::Request {
+            from: peer(),
+            serve: ServeId(0),
+            request: SyncRequest::GetBlocks(GetBlocks { ids: vec![] }),
+        },
+    );
+    deliver(&mut h, &child);
+    run(&mut h);
+
+    let metrics = &h.state.metrics;
+    for (kind, want) in [
+        (MessageKind::CoinTx, 1),
+        (MessageKind::BlockAnnounce, 1),
+        (MessageKind::ProofRequest, 0),
+        (MessageKind::Status, 1),
+        (MessageKind::SyncRequest, 1),
+        (MessageKind::SyncResponse, 1),
+    ] {
+        assert_eq!(metrics.received_of(kind), want, "{kind:?}");
+    }
+
+    // what went out is what the commands say: a request for the announced block and the
+    // answer to the request of the peer
+    let commands = drain(&mut h);
+    let count = |pick: fn(&Command) -> bool| {
+        u64::try_from(commands.iter().filter(|command| pick(command)).count()).unwrap()
+    };
+    let requests = count(|command| matches!(command, Command::Request { .. }));
+    let answers = count(|command| matches!(command, Command::Answer { .. }));
+    assert!(requests >= 1 && answers == 1, "{commands:?}");
+    assert_eq!(h.state.metrics.sent_of(MessageKind::SyncRequest), requests);
+    assert_eq!(h.state.metrics.sent_of(MessageKind::SyncResponse), answers);
+}
+
+#[test]
+fn a_status_and_a_broadcast_of_the_node_are_counted_when_it_sends_them() {
+    let mut h = harness();
+    with_genesis(&mut h);
+    to_node(
+        &h,
+        Inbound::PeerConnected {
+            peer: peer(),
+            peer_id: "70".into(),
+        },
+    );
+    let (reply, mut answer) = oneshot::channel();
+    let checked = submitted(transfer(CHAIN, 0));
+    to_api(&h, ApiRequest::SubmitTx { checked, reply });
+    run(&mut h);
+    assert!(matches!(answer.try_recv(), Ok(TxOutcome::Pooled(_))));
+    let metrics = &h.state.metrics;
+    assert_eq!(metrics.peers, 1);
+    for (kind, want) in [
+        (MessageKind::Status, 1),
+        (MessageKind::CoinTx, 1),
+        (MessageKind::BlockAnnounce, 0),
+        (MessageKind::ProofRequest, 0),
+        (MessageKind::SyncRequest, 0),
+        (MessageKind::SyncResponse, 0),
+    ] {
+        assert_eq!(metrics.sent_of(kind), want, "{kind:?}");
+    }
+}
+
+#[test]
+fn a_command_the_full_channel_dropped_is_not_counted_as_sent() {
+    let mut h = harness();
+    with_genesis(&mut h);
+    let capacity = node::COMMAND_CAPACITY;
+    let filled = u64::try_from(capacity).unwrap();
+    for _ in 0..capacity {
+        let status = Box::new(node::our_status(&h.state).unwrap());
+        let command = Command::Status {
+            peer: peer(),
+            status,
+        };
+        crate::p2p::send(&h.state.network, command, &mut h.state.metrics).unwrap();
+    }
+    assert_eq!(h.state.metrics.sent_of(MessageKind::Status), filled);
+    let status = Box::new(node::our_status(&h.state).unwrap());
+    let command = Command::Status {
+        peer: peer(),
+        status,
+    };
+    crate::p2p::send(&h.state.network, command, &mut h.state.metrics).unwrap();
+    assert_eq!(h.state.metrics.sent_of(MessageKind::Status), filled);
+    assert_eq!(h.state.metrics.dropped_commands, 1);
+}
+
+#[test]
+fn the_delay_of_an_announced_block_is_its_age_when_the_announcement_arrives() {
+    let mut h = harness();
+    let genesis = with_genesis(&mut h);
+    let child = block(&genesis, vec![]);
+    set_clock(child.header.timestamp.get().saturating_add(7));
+    announce(&mut h, child.header);
+    // the same announcement again is known and not counted
+    announce(&mut h, child.header);
+    run(&mut h);
+    assert_eq!(
+        (
+            h.state.metrics.block_delays,
+            h.state.metrics.block_delay_secs
+        ),
+        (1, 7)
+    );
 }

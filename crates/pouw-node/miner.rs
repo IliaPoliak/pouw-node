@@ -326,8 +326,9 @@ pub fn search_nonce(job: &SearchJob) -> NonceDone {
 /// proof tx on the loop thread when the block connects.
 ///
 /// The block of an ancestor of `NodeState::assume_valid` is not queued for this stage in
-/// initial block download (`docs/CHAINSPEC.md`, step 6 of `node::on_headers`). Skipping
-/// the proof check of those blocks as well is left to pouw-node#90.
+/// initial block download (`docs/CHAINSPEC.md`, `ibd::on_headers`). Its proofs are still
+/// verified when it connects: skipping those is a change of `pouw_consensus::apply_block`,
+/// not of the download.
 pub fn verify_work(params: &ConsensusParams, block: CheckedBlock) -> VerifiedWork {
     let verdict = verify_pow(params, &block.block.header, &block.block)
         .map(drop)

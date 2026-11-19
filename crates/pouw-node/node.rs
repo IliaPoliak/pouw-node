@@ -77,7 +77,7 @@ use pouw_api::event::{EventKind, Peer};
 use pouw_consensus::{ConsensusParams, InvalidTx, StateError};
 use pouw_crypto::Address;
 use pouw_provers::{Prover, ProverError};
-use pouw_types::{BlockHeader, BlockId, CumWork, Height, Timestamp};
+use pouw_types::{BlockId, CumWork, Height, Timestamp, block_id};
 use thiserror::Error;
 use tokio::{
     runtime,
@@ -91,8 +91,9 @@ use crate::{
     api::{self, ApiRequest, BlockQuery},
     chain::{self, BlockOutcome, ChainFault, HeaderOutcome, TxOutcome},
     events::{self, EventLog, SeqExhausted},
+    ibd::{self, Ibd},
     mempool::{self, Mempool},
-    metrics::{self, Metrics},
+    metrics::{self, MessageKind, Metrics},
     miner::{self, InFlight, Work, WorkDone},
     p2p::{
         self, Acceptance, Command, Gossip, Inbound, MessageId, Misbehavior, Network, NetworkError,
@@ -229,6 +230,9 @@ pub struct NodeState {
     pub pending: Pending,
     /// The id of the next request to a peer.
     pub next_request: RequestId,
+    /// Initial block download: the peers whose headers wait for their bodies, and the
+    /// window of bodies in flight.
+    pub ibd: Ibd,
     /// The work slot, the verify queue and the block being mined.
     pub work: Work,
     /// The current time.
@@ -418,11 +422,20 @@ pub fn handle(state: &mut NodeState, event: Event) -> Result<Flow, NodeFault> {
         Event::Net(Inbound::Gossip { id, from, message }) => {
             on_gossip(state, id, from, message)?;
         }
-        Event::Net(Inbound::Status { from, status }) => on_status(state, from, &status)?,
+        Event::Net(Inbound::Status { from, status }) => {
+            state.metrics.received(MessageKind::Status);
+            on_status(state, from, &status)?;
+        }
         Event::Net(Inbound::Request { serve, request, .. }) => {
+            state.metrics.received(MessageKind::SyncRequest);
             on_request(state, serve, &request)?;
         }
-        Event::Net(Inbound::Response { id, result }) => on_response(state, id, result)?,
+        Event::Net(Inbound::Response { id, result }) => {
+            if result.is_ok() {
+                state.metrics.received(MessageKind::SyncResponse);
+            }
+            on_response(state, id, result)?;
+        }
         Event::Net(Inbound::PeerConnected { peer, peer_id }) => {
             on_peer_connected(state, peer, &peer_id)?;
         }
@@ -568,7 +581,8 @@ fn on_work(state: &mut NodeState, done: WorkDone) -> Result<(), NodeFault> {
                     report(state, peer, Misbehavior::InvalidBlock)?;
                 }
             }
-            miner::dispatch(state)
+            miner::dispatch(state)?;
+            ibd::advance(state)
         }
     }
 }
@@ -582,6 +596,7 @@ fn on_gossip(
     message: Gossip,
 ) -> Result<(), NodeFault> {
     let topic = message.topic();
+    state.metrics.received(MessageKind::of_topic(topic));
     let acceptance = match message {
         Gossip::Tx(tx) => {
             let outcome = chain::receive_tx(
@@ -621,9 +636,13 @@ fn on_announce(
     announce: &CheckedAnnounce,
 ) -> Result<Acceptance, NodeFault> {
     let CheckedAnnounce { header, id } = announce;
-    match chain::receive_header(&mut state.store, &state.params, (state.clock)(), id, header)? {
+    let now = (state.clock)();
+    match chain::receive_header(&mut state.store, &state.params, now, id, header)? {
         HeaderOutcome::Known => Ok(Acceptance::Ignore),
         HeaderOutcome::Stored(_) => {
+            let late = now.0.saturating_sub(header.timestamp.get());
+            state.metrics.block_delays = state.metrics.block_delays.saturating_add(1);
+            state.metrics.block_delay_secs = state.metrics.block_delay_secs.saturating_add(late);
             sync::ask_block(
                 &state.network,
                 &mut state.pending,
@@ -716,72 +735,35 @@ fn on_response(
     id: RequestId,
     result: Result<Fetched, NetworkError>,
 ) -> Result<(), NodeFault> {
+    let window = ibd::take_window(&mut state.ibd, id);
     match sync::on_response(&mut state.pending, id, result) {
-        SyncOutcome::Blocks(synced) => connect_synced(state, synced),
-        SyncOutcome::Misbehaved(peer, why) => report(state, peer, why),
-        SyncOutcome::Headers { peer, headers } => on_headers(state, peer, &headers),
+        SyncOutcome::Blocks(synced) => match window {
+            Some(window) => ibd::on_window(state, window, synced)?,
+            None => connect_synced(state, synced)?,
+        },
+        SyncOutcome::Misbehaved(peer, why) => report(state, peer, why)?,
+        SyncOutcome::Headers { peer, headers } => ibd::on_headers(state, peer, &headers)?,
         SyncOutcome::Unreachable { peer, error } => {
             warn!(%error, ?peer, "sync request failed");
-            Ok(())
+            ibd::forget_source(&mut state.ibd, peer);
         }
-        SyncOutcome::Unsolicited => Ok(()),
-        SyncOutcome::TransportStopped => Err(NodeFault::TransportGone(TransportGone)),
+        SyncOutcome::Unsolicited => {}
+        SyncOutcome::TransportStopped => return Err(NodeFault::TransportGone(TransportGone)),
     }
-}
-
-/// Headers-first initial block download, pouw-node#90. Called with the headers `peer`
-/// sent after our `GetHeaders`, at most [`MAX_HEADERS_PER_RESPONSE`](p2p::limits::MAX_HEADERS_PER_RESPONSE) of them, each
-/// already prechecked for the chain id and its work claim. A peer is asked for headers
-/// by [`on_status`] when its cumulative work is above ours, and by [`on_announce`] when
-/// an announced parent is unknown.
-///
-/// To build:
-/// 1. Each header after the first has the id of the one before as parent; a break is
-///    [`Misbehavior::InvalidBlock`] for `peer` (see [`report`]).
-/// 2. Pass each header in order to [`chain::receive_header`]. `Known` is skipped,
-///    `Stored` is kept for step 4, `Invalid` is [`Misbehavior::InvalidBlock`] and ends the
-///    answer. `UnknownParent` on the first header means the peer ignored our locator, and
-///    is [`Misbehavior::InvalidBlock`] too.
-/// 3. A full answer of [`MAX_HEADERS_PER_RESPONSE`](p2p::limits::MAX_HEADERS_PER_RESPONSE) headers means more follow: ask again
-///    with `sync::ask_headers`, whose locator now starts at the stored headers.
-/// 4. Fetch bodies only once the cumulative work of the last stored header
-///    ([`IndexEntry::work`](store::schema::IndexEntry::work)) reaches `state.min_chain_work`, so a long chain of
-///    little work costs no downloads. Then ask for the bodies whose block is not stored,
-///    in height order, with `sync::request` and a [`SyncRequest::GetBlocks`] of at most
-///    [`MAX_BLOCKS_PER_REQUEST`](p2p::limits::MAX_BLOCKS_PER_REQUEST) ids. Keep one window in flight per peer and never ask
-///    two peers for the same id; the window bookkeeping is a new plain field of
-///    [`NodeState`].
-/// 5. The bodies come back as a `Blocks` answer to [`on_response`] and connect through
-///    [`connect_synced`], the verify queue and `chain::receive_block`. When a window is answered, ask the
-///    next one.
-/// 6. `state.assume_valid`: for its ancestors the verify-work stage
-///    (`miner::verify_work`, the proof of work check) may
-///    be skipped, as Bitcoin's `assumevalid` skips script checks. Header, target,
-///    timestamp and linking rules (step 2) and the other body rules still run for
-///    every block.
-///
-/// Limits: one `GetHeaders` and one window per peer at a time, and a peer that does not
-/// answer in time is [`Misbehavior::Unresponsive`].
-///
-/// Test: a node that starts empty with one peer that holds a chain of 5000 blocks
-/// reaches the tip of the peer, with the stored headers and bodies equal to the peer's.
-/// A second test uses a peer on a fork with more work and expects the chain to switch.
-fn on_headers(
-    _state: &mut NodeState,
-    peer: PeerIx,
-    headers: &[BlockHeader],
-) -> Result<(), NodeFault> {
-    todo!(
-        "pouw-node#90: initial block download from {peer:?} with {} headers",
-        headers.len()
-    )
+    ibd::advance(state)
 }
 
 /// Queues the received bodies for their work check, in order, so a block is checked and
-/// connected before the next one, which extends it.
-fn connect_synced(state: &mut NodeState, synced: SyncedBlocks) -> Result<(), NodeFault> {
+/// connected before the next one, which extends it. An ancestor of `assume_valid` that
+/// initial block download is fetching skips the check and connects at once (`ibd`).
+pub(crate) fn connect_synced(state: &mut NodeState, synced: SyncedBlocks) -> Result<(), NodeFault> {
     for block in synced.blocks {
-        miner::enqueue_verify(state, synced.peer, block)?;
+        let id = block_id(&block.block.header);
+        if ibd::take_assumed(&mut state.ibd, &id) {
+            connect_verified(state, synced.peer, &block)?;
+        } else {
+            miner::enqueue_verify(state, synced.peer, block)?;
+        }
     }
     Ok(())
 }
@@ -817,12 +799,19 @@ fn connect_verified(
     }
 }
 
-fn report(state: &mut NodeState, peer: PeerIx, why: Misbehavior) -> Result<(), NodeFault> {
+/// Reports `peer` to the transport. A peer that misbehaved is no source of blocks any more,
+/// and its blocks that wait in the verify queue are dropped (`ibd::forget_peer`).
+pub(crate) fn report(
+    state: &mut NodeState,
+    peer: PeerIx,
+    why: Misbehavior,
+) -> Result<(), NodeFault> {
     p2p::send(
         &state.network,
         Command::Report(peer, why),
         &mut state.metrics,
     )?;
+    ibd::forget_peer(state, peer);
     Ok(())
 }
 
@@ -849,7 +838,7 @@ fn on_peer_disconnected(
         EventKind::PeerDisconnected(peer_view(peer_id)),
     )?;
     sync::on_peer_disconnected(&mut state.pending, peer);
-    Ok(())
+    ibd::on_peer_disconnected(state, peer)
 }
 
 fn on_submit_tx(
@@ -885,7 +874,8 @@ pub(crate) fn on_tick(state: &mut NodeState) -> Result<(), NodeFault> {
         let snapshot = mempool::snapshot(&state.mempool);
         events::emit(&mut state.events, EventKind::MempoolSnapshot(snapshot))?;
     }
-    miner::dispatch(state)
+    miner::dispatch(state)?;
+    ibd::advance(state)
 }
 
 fn refresh_gauges(
