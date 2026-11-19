@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeMap, fmt, str::FromStr};
 
-use pouw_crypto::Address;
+use pouw_crypto::{Address, FieldInput};
 use pouw_types::{Amount, BlockId, ChainId, CircuitId, Height, ProofHash, ProofSystem, TxId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use thiserror::Error;
@@ -51,6 +51,9 @@ pub enum EventKind {
     ProofRequestStarted(ProofRequestStarted),
     /// This miner finished a proof.
     ProofProduced(ProofProduced),
+    /// The outcome of the lottery for one proof this miner made: it stayed in the chain
+    /// (`won`) or it did not.
+    LotteryResult(LotteryResult),
     /// A block arrived from a peer, before verification.
     BlockReceived(BlockReceived),
     BlockVerified(BlockVerified),
@@ -76,6 +79,7 @@ impl EventKind {
             EventKind::TxRejected(_) => "tx_rejected",
             EventKind::ProofRequestStarted(_) => "proof_request_started",
             EventKind::ProofProduced(_) => "proof_produced",
+            EventKind::LotteryResult(_) => "lottery_result",
             EventKind::BlockReceived(_) => "block_received",
             EventKind::BlockVerified(_) => "block_verified",
             EventKind::BlockAccepted(_) => "block_accepted",
@@ -129,6 +133,28 @@ pub struct ProofProduced {
     /// Wall time of proving by this node.
     pub prove_ms: u64,
     pub proof_hash: ProofHash,
+}
+
+/// Data of [`EventKind::LotteryResult`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LotteryResult {
+    /// The proof request.
+    pub txid: TxId,
+    pub proof_hash: ProofHash,
+    pub circuit: CircuitId,
+    /// The block with this proof is in the chain of the node. A proof that won can still
+    /// lose later: a reorganization that drops the block is a second event of the same
+    /// `proof_hash` with `won: false` and the reason `orphaned`.
+    pub won: bool,
+    /// Why the proof lost, absent when it won: `superseded` (the tip moved to a block of
+    /// another miner before ours was found), `request_gone` (the request left the
+    /// mempool before a block took the proof) or `orphaned` (our block was dropped by a
+    /// reorganization).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub eta: FieldInput,
+    pub mask: FieldInput,
+    pub usage_counter: u64,
 }
 
 /// Data of [`EventKind::BlockReceived`].

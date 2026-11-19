@@ -95,12 +95,16 @@ pub const BLOCK_PROOFS: Metric = Metric {
     kind: MetricKind::Counter,
 };
 
-/// Header timestamp of a connected block minus the one of its parent.
+/// Header timestamp of a connected block minus the one of its parent. The buckets are
+/// [`BLOCK_TIME_BOUNDS`], so `histogram_quantile` works on it.
 pub const BLOCK_TIME_SECONDS: Metric = Metric {
     name: "pouw_node_block_time_seconds",
     help: "Seconds between a connected block and its parent, by header timestamps.",
     kind: MetricKind::Histogram,
 };
+
+/// The upper bounds in seconds of the buckets of [`BLOCK_TIME_SECONDS`], besides `+Inf`.
+pub const BLOCK_TIME_BOUNDS: [u64; 8] = [1, 5, 10, 20, 30, 60, 120, 300];
 
 /// Nonces this node tried while mining, the attempts of the lottery.
 pub const LOTTERY_ATTEMPTS: Metric = Metric {
@@ -229,6 +233,10 @@ pub struct Metrics {
     pub block_proofs: u64,
     /// Sum of [`BLOCK_TIME_SECONDS`] in seconds.
     pub block_time_secs: u64,
+    /// Blocks counted in [`BLOCK_TIME_SECONDS`] by bucket: entry `i` holds the blocks
+    /// above bound `i - 1` and up to [`BLOCK_TIME_BOUNDS`]`[i]`. Blocks above the last
+    /// bound are only in `blocks_connected`.
+    pub block_time_buckets: [u64; BLOCK_TIME_BOUNDS.len()],
     /// [`LOTTERY_ATTEMPTS`].
     pub lottery_attempts: u64,
     /// [`MESSAGES_RECEIVED`], by [`MessageKind::index`].
@@ -242,6 +250,16 @@ pub struct Metrics {
 }
 
 impl Metrics {
+    /// Counts a block that extended the tip, `secs` after its parent.
+    pub fn connected_block(&mut self, secs: u64) {
+        self.blocks_connected = self.blocks_connected.saturating_add(1);
+        self.block_time_secs = self.block_time_secs.saturating_add(secs);
+        let bucket = BLOCK_TIME_BOUNDS.iter().position(|bound| secs <= *bound);
+        if let Some(count) = bucket.and_then(|i| self.block_time_buckets.get_mut(i)) {
+            *count = count.saturating_add(1);
+        }
+    }
+
     /// Counts a message of `kind` received.
     pub fn received(&mut self, kind: MessageKind) {
         if let Some(count) = self.messages_received.get_mut(kind.index()) {
@@ -297,8 +315,9 @@ pub fn render(metrics: &Metrics) -> String {
     ));
     let metric = BLOCK_TIME_SECONDS;
     sections.push(format!(
-        "{header}{name}_bucket{{le=\"+Inf\"}} {count}\n{name}_sum {sum}\n{name}_count {count}\n",
+        "{header}{buckets}{name}_bucket{{le=\"+Inf\"}} {count}\n{name}_sum {sum}\n{name}_count {count}\n",
         header = header(metric),
+        buckets = block_time_buckets(metrics),
         name = metric.name,
         count = metrics.blocks_connected,
         sum = metrics.block_time_secs,
@@ -339,6 +358,28 @@ pub fn render(metrics: &Metrics) -> String {
 /// [`crate::api::ApiRequest::Metrics`], see [`crate::http`].
 pub fn serve(addr: SocketAddr, api: &mpsc::Sender<ApiRequest>) -> Result<(), ComponentFault> {
     crate::http::serve_metrics(addr, api)
+}
+
+/// The lines `_bucket{le="<bound>"}` of [`BLOCK_TIME_SECONDS`], each counting the blocks up
+/// to its bound, as Prometheus wants.
+fn block_time_buckets(metrics: &Metrics) -> String {
+    let mut total = 0_u64;
+    BLOCK_TIME_BOUNDS
+        .iter()
+        .zip(&metrics.block_time_buckets)
+        .map(|(bound, count)| {
+            total = total.saturating_add(*count);
+            [
+                BLOCK_TIME_SECONDS.name,
+                "_bucket{le=\"",
+                &bound.to_string(),
+                "\"} ",
+                &total.to_string(),
+                "\n",
+            ]
+            .concat()
+        })
+        .collect()
 }
 
 fn header(metric: Metric) -> String {
@@ -396,6 +437,29 @@ mod tests {
         assert!(text.contains("# TYPE pouw_node_block_time_seconds histogram\n"));
         assert!(text.contains("pouw_node_block_time_seconds_sum 40\n"));
         assert!(text.contains("pouw_node_block_time_seconds_count 4\n"));
+    }
+
+    #[test]
+    fn the_block_time_has_cumulative_buckets() {
+        let mut metrics = Metrics::default();
+        for secs in [0, 4, 5, 30, 400] {
+            metrics.connected_block(secs);
+        }
+        assert_eq!(metrics.blocks_connected, 5);
+        assert_eq!(metrics.block_time_secs, 439);
+        let text = render(&metrics);
+        for line in [
+            "pouw_node_block_time_seconds_bucket{le=\"1\"} 1\n",
+            "pouw_node_block_time_seconds_bucket{le=\"5\"} 3\n",
+            "pouw_node_block_time_seconds_bucket{le=\"10\"} 3\n",
+            "pouw_node_block_time_seconds_bucket{le=\"30\"} 4\n",
+            "pouw_node_block_time_seconds_bucket{le=\"300\"} 4\n",
+            "pouw_node_block_time_seconds_bucket{le=\"+Inf\"} 5\n",
+            "pouw_node_block_time_seconds_sum 439\n",
+            "pouw_node_block_time_seconds_count 5\n",
+        ] {
+            assert!(text.contains(line), "missing {line:?} in {text}");
+        }
     }
 
     #[test]

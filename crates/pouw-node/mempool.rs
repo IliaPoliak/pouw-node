@@ -35,7 +35,9 @@ use std::{
 
 use pouw_api::{event::MempoolSnapshot, view::MempoolView};
 use pouw_crypto::Address;
-use pouw_types::{Amount, CircuitId, FastMap, Nonce, SignedTx, TxBody, TxId, TxKind, encoded_len};
+use pouw_types::{
+    Amount, CircuitId, FastMap, Nonce, SignedTx, TxBody, TxId, TxKind, bucket, encoded_len,
+};
 use thiserror::Error;
 
 /// Most bytes of `verifying_key` and `circuit` together that the node relays and
@@ -358,6 +360,17 @@ pub fn proof_requests(pool: &Mempool) -> impl Iterator<Item = (&TxId, &SignedTx)
     iter(pool).filter(|(_, tx)| matches!(tx.body.kind, TxKind::ProofRequest { .. }))
 }
 
+/// The pending proof requests of bucket `bucket_id` among `bucket_count` buckets, see
+/// [`pouw_types::bucket`]. Nothing for a `bucket_count` of 0 or a `bucket_id` that is
+/// not below it.
+pub fn proof_requests_in_bucket(
+    pool: &Mempool,
+    bucket_count: u32,
+    bucket_id: u32,
+) -> impl Iterator<Item = (&TxId, &SignedTx)> {
+    proof_requests(pool).filter(move |(id, _)| bucket(id, bucket_count) == Some(bucket_id))
+}
+
 /// Pending proof requests per circuit, for the `mempool_snapshot` event.
 pub fn by_circuit(pool: &Mempool) -> BTreeMap<CircuitId, u64> {
     let mut counts = BTreeMap::new();
@@ -525,6 +538,27 @@ mod tests {
         assert_eq!(proof_requests(&pool).count(), 20);
         assert_eq!(pool.txs.len() - proof_requests(&pool).count(), 1);
         assert_eq!(by_circuit(&pool).values().sum::<u64>(), 20);
+    }
+
+    #[test]
+    fn requests_are_listed_by_bucket() {
+        let mut pool = empty(LIMITS);
+        for n in 0..20 {
+            add(&mut pool, request(n)).unwrap();
+        }
+        add(&mut pool, transfer(99)).unwrap();
+        let mut seen = 0;
+        for id_bucket in 0..4 {
+            for (id, _) in proof_requests_in_bucket(&pool, 4, id_bucket) {
+                assert_eq!(bucket(id, 4), Some(id_bucket));
+                seen += 1;
+            }
+        }
+        // Every request is in exactly one bucket and the transfer in none.
+        assert_eq!(seen, 20);
+        assert_eq!(proof_requests_in_bucket(&pool, 1, 0).count(), 20);
+        assert_eq!(proof_requests_in_bucket(&pool, 4, 4).count(), 0);
+        assert_eq!(proof_requests_in_bucket(&pool, 0, 0).count(), 0);
     }
 
     fn empty(limits: MempoolLimits) -> Mempool {
